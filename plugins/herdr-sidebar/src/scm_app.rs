@@ -758,19 +758,12 @@ impl App {
         }
     }
 
-    /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
-    /// immediately re-dock a fresh one) and close our own pane. The herdr
-    /// prefix+b keybinding (→ the toggle action) brings it back.
+    /// Hide the sidebar: snooze this tab, remember the workspace as hidden,
+    /// and close our own pane. The plugin toggle action brings it back
+    /// (herdr's built-in prefix+b is Herdr's own sidebar, not this plugin).
     fn hide(&mut self) {
         let Some(ctl) = &self.pane_ctl else { return };
-        if let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
-            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
-        }
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.close",
-            serde_json::json!({ "pane_id": ctl.pane_id }),
-        );
+        herdr_sidebar::snooze::hide_pane(&ctl.pane_id);
     }
 
     /// Re-read every repo's git status (this is the change auto-detection —
@@ -1800,7 +1793,7 @@ impl App {
             ),
             (
                 Setting::AutoOpen,
-                "Auto-open sidebar",
+                "Auto-open (new spaces)",
                 if self.sidebar_state.auto_open {
                     "on"
                 } else {

@@ -183,10 +183,10 @@ pub struct State {
     /// The first-run "install a Nerd Font?" prompt was answered (either
     /// way) — never show it again.
     pub font_prompt_done: bool,
-    /// The focus/created event hooks auto-dock a sidebar into tabs that lack
-    /// one. Off = the sidebar stays closed until the user invokes the
-    /// open-sidebar toggle themselves (issue #8); the explicit toggle always
-    /// works regardless.
+    /// Default for workspaces with no hide/show record. Off = unknown spaces
+    /// stay closed until the user toggles the sidebar open (issue #8); the
+    /// explicit toggle always works. Hide/`b` and toggle write `visibility.json`
+    /// so a later pane.focused in that space does not follow this default.
     pub auto_open: bool,
     /// The open-sidebar toggle treats an open-but-unfocused sidebar as CLOSE
     /// instead of FOCUS: one press opens, the next press closes, wherever
@@ -741,6 +741,91 @@ pub fn save_root(label: &str, root: &Path) {
     }
 }
 
+/// Per-workspace "should this space auto-dock a sidebar?" remembered from
+/// an explicit toggle or hide. Keyed like [`save_root`]: by workspace
+/// **label**, falling back to the workspace id when the label is unknown.
+///
+/// Unknown spaces follow the global `auto_open` setting. Hide/`b` records
+/// off; the open-sidebar toggle records on. Quiet ensure hooks must not
+/// write this file — auto-docking is not a user choice.
+type VisibilityFile = serde_json::Map<String, serde_json::Value>;
+
+fn visibility_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("visibility.json"))
+}
+
+fn decode_visibility_file(json: &str) -> VisibilityFile {
+    serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn visibility_key(label: &str, workspace_id: &str) -> String {
+    if !label.is_empty() {
+        label.to_string()
+    } else {
+        workspace_id.to_string()
+    }
+}
+
+fn recorded_visible(file: &VisibilityFile, key: &str) -> Option<bool> {
+    if key.is_empty() {
+        return None;
+    }
+    file.get(key).and_then(|v| v.as_bool())
+}
+
+fn auto_open_decision(global: bool, recorded: Option<bool>) -> bool {
+    recorded.unwrap_or(global)
+}
+
+pub fn should_auto_open_workspace(global: bool, label: &str, workspace_id: &str) -> bool {
+    let key = visibility_key(label, workspace_id);
+    let recorded = visibility_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|json| decode_visibility_file(&json))
+        .and_then(|file| recorded_visible(&file, &key));
+    auto_open_decision(global, recorded)
+}
+
+/// Persist a user choice for this space. Empty label+id is ignored so we
+/// never write a catch-all key that would clobber every unnamed workspace.
+pub fn remember_visible(label: &str, workspace_id: &str, visible: bool) {
+    let key = visibility_key(label, workspace_id);
+    if key.is_empty() {
+        return;
+    }
+    let Some(path) = visibility_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Some(_lock) = StateWriteLock::acquire(&path) else {
+        return;
+    };
+    let mut file = std::fs::read_to_string(&path)
+        .map(|json| decode_visibility_file(&json))
+        .unwrap_or_default();
+    file.insert(key, serde_json::json!(visible));
+    if let Ok(json) = serde_json::to_string(&file) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+pub fn remember_visible_for_pane(
+    pane_list_json: &str,
+    workspace_list_json: &str,
+    pane_id: &str,
+    visible: bool,
+) {
+    let workspace_id = crate::launch::workspace_of(pane_list_json, pane_id);
+    let label = crate::launch::workspace_label(workspace_list_json, &workspace_id);
+    remember_visible(&label, &workspace_id, visible);
+}
+
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
 /// hand-edited or truncated file can never wedge the panels.
 pub fn parse_state(json: &str) -> State {
@@ -990,6 +1075,26 @@ mod tests {
             assert_eq!(follow_cwd_setting_value(true), "on");
             assert_eq!(follow_cwd_setting_value(false), "off");
         }
+    }
+
+    #[test]
+    fn workspace_visibility_prefers_label_and_unknown_spaces_follow_auto_open() {
+        assert_eq!(visibility_key("NeonGame", "w1"), "NeonGame");
+        assert_eq!(visibility_key("", "w1"), "w1");
+        assert_eq!(visibility_key("", ""), "");
+
+        let file = decode_visibility_file(r#"{"NeonGame":false,"acme-app":true}"#);
+        assert_eq!(recorded_visible(&file, "NeonGame"), Some(false));
+        assert_eq!(recorded_visible(&file, "acme-app"), Some(true));
+        assert_eq!(recorded_visible(&file, "other"), None);
+        assert_eq!(recorded_visible(&file, ""), None);
+        assert!(decode_visibility_file("garbage").is_empty());
+        assert!(decode_visibility_file("[]").is_empty());
+
+        assert!(!auto_open_decision(true, Some(false)));
+        assert!(auto_open_decision(false, Some(true)));
+        assert!(auto_open_decision(true, None));
+        assert!(!auto_open_decision(false, None));
     }
 
     #[test]

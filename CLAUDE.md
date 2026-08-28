@@ -428,6 +428,14 @@ HACKING.md — budget time for that before promising a patched build.
   forwards it via the `env` param (`state::spawn_env`). Legacy
   `%APPDATA%\herdr\aa-sidebar.json` is migrated on first load. A fresh sidebar opens on
   the last-active view.
+- **Per-workspace visibility** lives in `visibility.json` next to `state.json`, keyed
+  by workspace **label** (same reason as `roots.json`: ids are instance handles).
+  An explicit toggle OPEN records `true`; hide (`b` / `«`) or toggle CLOSE records
+  `false`. Quiet ensure hooks never write this file. Unknown spaces follow ⚙
+  `Auto-open (new spaces)`. `pane.focused` carries only `pane_id` + `workspace_id`
+  (no `tab_id`), so tab snooze used to miss a click on Perforce/shell in the same
+  tab and immediately redock; ensure now locates the pane's tab AND checks the
+  workspace record, so a hidden Perforce space stays hidden.
 - Sidebar width is a persisted column target (32 by default, 24–80 in 4-column steps), not
   a frozen split ratio. A change to the whole tab area re-applies it through the ratio-aware
   resize path; a pane-only divider resize is respected for the current layout instead of
@@ -573,10 +581,12 @@ HACKING.md — budget time for that before promising a patched build.
   the outline ✨ silhouette) in the material theme.
 - There is NO collapse-to-sliver mode anymore (herdr's 10% ratio floor made the sliver
   a wide empty strip — user-rejected). « bottom-right / `b` HIDE the sidebar instead:
-  per-tab snooze marker + `pane.close` of its own pane (`hide()` in both apps,
-  `src/snooze.rs` shared with the ensure hook, `launch::tab_of`). The herdr keybinding
-  `prefix+b` (config.toml `[[keys.command]]` → the toggle action, like the other plugin
-  binds) brings it back — or hides it again when it's focused.
+  per-tab snooze marker + workspace visibility `false` + `pane.close` (`hide_pane` in
+  `src/snooze.rs`). Herdr's built-in `prefix+b` is **Herdr's own sidebar**
+  (`keys.toggle_sidebar`), not this plugin — rebound `prefix+b` steals that. Bind a
+  different chord, e.g. `prefix+shift+b` → `herdr plugin action invoke
+  open-sidebar-windows --plugin herdr-sidebar` (unix: `open-sidebar`). The toggle
+  records the current workspace on so later tab/pane focus auto-docks there again.
 - **Esc must never exit a sidebar TUI** — a stray Esc used to drop the pane back to the
   shell prompt (user-reported). Esc closes overlays, then closes this tab's preview
   pane if one is docked here (`viewer::close_in_tab`); only `q` quits. Inside a

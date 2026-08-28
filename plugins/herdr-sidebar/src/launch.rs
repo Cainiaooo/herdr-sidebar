@@ -472,26 +472,85 @@ pub fn layout_width(layout_json: &str) -> Option<i64> {
 /// cwd, which during a workspace switch is still the space you came from —
 /// observed live as tremor's sidebar rooted in bedrock. The payload knows
 /// which tab is being docked; this is that answer.
-pub fn event_scope(event_json: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(strip_bom(event_json)) else {
-        return String::new();
-    };
+fn event_field(event_json: &str, key: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(strip_bom(event_json)).ok()?;
     let data = value.get("data").unwrap_or(&value);
-    let pick = |key: &str| -> Option<String> {
-        data.get(key)
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                // workspace_created carries a nested WorkspaceInfo.
-                data.get(key.trim_end_matches("_id"))
-                    .and_then(|w| w.get(key))
-                    .and_then(|v| v.as_str())
-            })
-            .map(str::to_string)
-    };
-    pick("tab_id")
-        .or_else(|| pick("workspace_id"))
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            // workspace_created carries a nested WorkspaceInfo.
+            data.get(key.trim_end_matches("_id"))
+                .and_then(|w| w.get(key))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_string)
+}
+
+pub fn event_scope(event_json: &str) -> String {
+    event_field(event_json, "tab_id")
+        .or_else(|| event_field(event_json, "workspace_id"))
         .filter(|s| is_flag_safe(s))
         .unwrap_or_default()
+}
+
+/// `pane.focused` carries `pane_id` (and `workspace_id`) but no `tab_id`.
+pub fn event_pane_id(event_json: &str) -> String {
+    event_field(event_json, "pane_id")
+        .filter(|s| is_flag_safe(s))
+        .unwrap_or_default()
+}
+
+/// Tab whose snooze marker the ensure hook should honor for this event.
+///
+/// `pane.focused` has no `tab_id`, so a workspace-only scope must not borrow
+/// another space's marker — unless the payload names a pane we can locate.
+pub fn snooze_tab(event_json: &str, pane_list_json: &str, scope: &str) -> String {
+    if scope.contains(':') {
+        return scope.to_string();
+    }
+    let pane_id = event_pane_id(event_json);
+    if !pane_id.is_empty() {
+        let tab = tab_of(pane_list_json, &pane_id);
+        if !tab.is_empty() {
+            return tab;
+        }
+    }
+    if scope.is_empty() {
+        focused_tab(pane_list_json)
+    } else {
+        String::new()
+    }
+}
+
+/// Workspace id for an event scope: a tab id (`w4:tY`) maps to that tab's
+/// space, a bare workspace id is used as-is, and an empty (toggle) scope
+/// takes the focused pane's workspace.
+pub fn workspace_id_from_scope(scope: &str, pane_list_json: &str) -> String {
+    let from_panes = if let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json))
+    {
+        let pane = if scope.contains(':') {
+            msg.result.panes.iter().find(|p| p.tab_id.as_deref() == Some(scope))
+        } else if scope.is_empty() {
+            msg.result.panes.iter().find(|p| p.focused)
+        } else {
+            msg.result
+                .panes
+                .iter()
+                .find(|p| p.workspace_id.as_deref() == Some(scope))
+        };
+        pane.and_then(|p| p.workspace_id.clone())
+    } else {
+        None
+    };
+    if let Some(id) = from_panes.filter(|id| is_flag_safe(id)) {
+        return id;
+    }
+    if let Some((ws, _)) = scope.split_once(':')
+        && is_flag_safe(ws)
+    {
+        return ws.to_string();
+    }
+    if is_flag_safe(scope) { scope.to_string() } else { String::new() }
 }
 
 /// The pane whose cwd a sidebar docked into `scope` should be rooted from:
@@ -597,6 +656,20 @@ pub fn focused_tab(pane_list_json: &str) -> String {
         .find(|p| p.focused)
         .and_then(|p| p.tab_id.clone())
         .filter(|t| is_flag_safe(t))
+        .unwrap_or_default()
+}
+
+/// The focused pane's workspace id from a `pane list` JSON (flag-safe, else empty).
+pub fn focused_workspace(pane_list_json: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.focused)
+        .and_then(|p| p.workspace_id.clone())
+        .filter(|id| is_flag_safe(id))
         .unwrap_or_default()
 }
 
@@ -921,6 +994,24 @@ mod tests {
         assert_eq!(event_scope("garbage"), "");
         // Shell-unsafe ids are dropped, same as the event kind.
         assert_eq!(event_scope(r#"{"data":{"workspace_id":"a b; rm -rf /"}}"#), "");
+    }
+
+    #[test]
+    fn pane_focused_events_resolve_their_own_tab_and_workspace() {
+        let event = r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w2:p9","workspace_id":"w2"}}"#;
+        assert_eq!(event_scope(event), "w2");
+        assert_eq!(event_pane_id(event), "w2:p9");
+        let panes = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","focused":true},
+               {"pane_id":"w2:p9","tab_id":"w2:t3","workspace_id":"w2"}"#,
+        );
+        assert_eq!(snooze_tab(event, &panes, "w2"), "w2:t3");
+        assert_eq!(workspace_id_from_scope("w2", &panes), "w2");
+        assert_eq!(workspace_id_from_scope("w2:t3", &panes), "w2");
+        assert_eq!(workspace_id_from_scope("", &panes), "w1");
+        assert_eq!(focused_workspace(&panes), "w1");
+        // A workspace-only scope with no pane id must not borrow another tab.
+        assert_eq!(snooze_tab("", &panes, "w2"), "");
     }
 
     /// The hook fires for five different events into ONE script, so the only

@@ -85,9 +85,45 @@ fn main() -> std::io::Result<()> {
             return Ok(());
         }
         Some("--auto-open") => {
-            // For the unix ensure hook: skip auto-docking when the user
-            // turned "Auto-open sidebar" off in ⚙ Settings (issue #8).
+            // Global ⚙ Settings value. Prefer `--should-auto-open` in hooks:
+            // that also honors the per-workspace hide/toggle record.
             println!("{}", if state::load_state().auto_open { "on" } else { "off" });
+            return Ok(());
+        }
+        Some("--should-auto-open") => {
+            // Unix ensure hook: workspace list JSON on stdin, workspace id
+            // as the next arg. Recorded hide/show outranks the global default.
+            let workspace_id = std::env::args().nth(2).unwrap_or_default();
+            let list = read_stdin().unwrap_or_default();
+            let label = launch::workspace_label(&list, &workspace_id);
+            let on = state::should_auto_open_workspace(
+                state::load_state().auto_open,
+                &label,
+                &workspace_id,
+            );
+            println!("{}", if on { "on" } else { "off" });
+            return Ok(());
+        }
+        Some("--remember-sidebar") => {
+            // Unix toggle launcher: `on`/`off` then workspace id; workspace
+            // list JSON on stdin so the record is keyed by label.
+            let visible = std::env::args().nth(2).is_some_and(|v| {
+                matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1")
+            });
+            let workspace_id = std::env::args().nth(3).unwrap_or_default();
+            let list = read_stdin().unwrap_or_default();
+            let label = launch::workspace_label(&list, &workspace_id);
+            state::remember_visible(&label, &workspace_id, visible);
+            return Ok(());
+        }
+        Some("--focused-workspace") => {
+            println!("{}", launch::focused_workspace(&read_stdin()?));
+            return Ok(());
+        }
+        Some("--snooze-tab") => {
+            let scope = std::env::args().nth(2).unwrap_or_default();
+            let event = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+            println!("{}", launch::snooze_tab(&event, &read_stdin()?, &scope));
             return Ok(());
         }
         Some("--focus-on-open") => {
@@ -118,7 +154,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--focused-workspace|--auto-open|--should-auto-open [ws]|--remember-sidebar on|off [ws]|--snooze-tab [scope]|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
