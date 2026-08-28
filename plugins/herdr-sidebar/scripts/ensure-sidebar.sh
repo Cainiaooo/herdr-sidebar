@@ -14,17 +14,18 @@ bin="$bin_dir/herdr-sidebar"
 [ -x "$bin" ] || exit 0
 
 # Per-workspace hide/toggle outranks ⚙ Settings → Auto-open sidebar.
-# Unknown spaces follow the global default (issue #8). Checked before the
-# lock so a disabled hook never contends with a user toggle.
+# Unknown spaces follow the global default (issue #8). Do not exit on
+# "off" before launch-decision: a hidden space can still hold a label-only
+# corpse that must be REPLACE-closed (Windows sidecar already does this).
+# `herdr workspace list` already prints JSON; `--json` is rejected on 0.8.2.
 scope="$("$bin" --event-scope 2>/dev/null || true)"
 ws_id="${scope%%:*}"
-ws_list="$("$herdr_bin" workspace list --json 2>/dev/null || true)"
+ws_list="$("$herdr_bin" workspace list 2>/dev/null || true)"
 if [ -n "$ws_id" ]; then
   should="$(printf '%s' "$ws_list" | "$bin" --should-auto-open "$ws_id" 2>/dev/null || echo on)"
 else
   should="$("$bin" --auto-open 2>/dev/null || echo on)"
 fi
-[ "$should" = "off" ] && exit 0
 
 # Focus events arrive in bursts and concurrent ensures each open an explorer —
 # serialize with an atomic mkdir lock. Focus events may skip a held lock because
@@ -80,6 +81,12 @@ case "$decision" in
     ;;
   *) exit 0 ;;
 esac
+
+# After REPLACE cleanup, a hidden workspace must not redock. Live FOCUS/CLOSE
+# already exited above; OPEN with should=off is a no-op too.
+if [ "$should" = "off" ]; then
+  exit 0
+fi
 
 # Respect a tab the user toggled closed (open-explorer.sh writes the marker) —
 # otherwise the very next focus event would reopen what they just closed.

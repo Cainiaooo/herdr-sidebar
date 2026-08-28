@@ -84,9 +84,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
                     // Strict toggle (⚙ Settings): one press opens, the next
                     // press closes, wherever focus is. The unix launchers get
                     // the same mapping from the --launch-decision CLI mode.
-                    graceful_close(id);
-                    snooze::set(&snooze_dir, &tab);
-                    remember_scope(&panes, &scope, false);
+                    persist_hide_after_close(id, &snooze_dir, &tab, &panes, &scope);
                 } else {
                     focus(id)?;
                     remember_scope(&panes, &scope, true);
@@ -95,9 +93,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
         }
         Some(("CLOSE", id)) => {
             if toggle {
-                graceful_close(id);
-                snooze::set(&snooze_dir, &tab);
-                remember_scope(&panes, &scope, false);
+                persist_hide_after_close(id, &snooze_dir, &tab, &panes, &scope);
             }
         }
         Some(("REPLACE", id)) => {
@@ -153,7 +149,26 @@ fn remember_scope(panes: &str, scope: &str, visible: bool) {
     crate::state::remember_visible(&label, &workspace_id, visible);
 }
 
-fn graceful_close(pane_id: &str) {
+/// Snooze + persist hidden only after the pane acknowledged a safe quit.
+/// A cancelled close (dirty editor, probe error) must leave the live pane
+/// and the workspace record alone, or the next hook treats an open sidebar
+/// as hidden.
+fn persist_hide_after_close(
+    pane_id: &str,
+    snooze_dir: &std::path::Path,
+    tab: &str,
+    panes: &str,
+    scope: &str,
+) -> bool {
+    if !graceful_close(pane_id) {
+        return false;
+    }
+    snooze::set(snooze_dir, tab);
+    remember_scope(panes, scope, false);
+    true
+}
+
+fn graceful_close(pane_id: &str) -> bool {
     let _ = ipc::call_text(
         "pane.send_input",
         serde_json::json!({ "pane_id": pane_id, "text": "", "keys": ["ctrl+q"] }),
@@ -170,6 +185,7 @@ fn graceful_close(pane_id: &str) {
     }
     if acknowledged {
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+        true
     } else {
         let _ = ipc::call_text(
             "notification.show",
@@ -180,6 +196,7 @@ fn graceful_close(pane_id: &str) {
                 "sound": "none",
             }),
         );
+        false
     }
 }
 

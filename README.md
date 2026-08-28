@@ -34,8 +34,10 @@ on either edge of every herdr tab (left by default), restores itself on focus, a
 entirely by click or keystroke.
 
 ```
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
+herdr plugin install Cainiaooo/herdr-sidebar/plugins/herdr-sidebar --yes
 ```
+
+That is **this fork**. The public upstream remains `alexarthurs/herdr-sidebar/plugins/herdr-sidebar` and does not include the per-workspace hide/show record. `--yes` is required when stdin is not a TTY.
 
 Tagged releases install SHA-256-verified prebuilt binaries on supported Windows, macOS,
 and Linux systems. Unsupported targets or unavailable assets fall back to a source build.

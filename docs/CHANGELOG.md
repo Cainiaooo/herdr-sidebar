@@ -10,6 +10,27 @@ Base: upstream `13ebde8` (after PR #39, 2026-08).
 
 ---
 
+## 2026-08-28 — review fixes (unix list, hide-after-close, install path)
+
+Codex review of the visibility patch (`upstream/main...HEAD`).
+
+### Fixed
+
+- Unix ensure/toggle called `herdr workspace list --json`. Herdr 0.8.2 rejects
+  `--json` (exit 2); empty stdin made `--should-auto-open` / `--remember-sidebar`
+  fall back to the transient workspace id, so label-keyed hides from the TUI
+  were ignored. Use `herdr workspace list` (already JSON), matching `redeploy.sh`.
+- Toggle close recorded the workspace as hidden even when `graceful_close` was
+  cancelled (dirty editor). Windows sidecar and unix `open-sidebar.sh` now snooze
+  and persist `false` only after the pane acknowledges quit.
+- Unix ensure exited on `should=off` *before* `launch-decision`, so a label-only
+  corpse in a hidden workspace was never REPLACE-closed. It now closes corpses
+  first, then skips redocking — same as the Windows sidecar.
+- Fork README install snippets pointed at `alexarthurs/herdr-sidebar`. They now
+  install `Cainiaooo/herdr-sidebar` and name the public repo as upstream-only.
+
+---
+
 ## 2026-08-28 — per-workspace sidebar visibility
 
 **Commits:** `995ab07`, merge `5dca988`.

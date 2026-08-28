@@ -125,7 +125,7 @@ remember_sidebar() {
   ws_id="$(printf '%s' "$panes" | "$bin" --focused-workspace 2>/dev/null || true)"
   [ -n "$ws_id" ] || return 0
   local list
-  list="$("$herdr_bin" workspace list --json 2>/dev/null || true)"
+  list="$("$herdr_bin" workspace list 2>/dev/null || true)"
   printf '%s' "$list" | "$bin" --remember-sidebar "$vis" "$ws_id" >/dev/null 2>&1 || true
 }
 
@@ -142,11 +142,12 @@ graceful_close() {
   done
   if [ -n "$acknowledged" ]; then
     "$herdr_bin" pane close "$pane_id" >/dev/null 2>&1 || true
-  else
-    "$herdr_bin" notification show "Sidebar close cancelled" \
-      --body "The pane did not acknowledge a safe shutdown; try again shortly." \
-      --position bottom-right --sound none >/dev/null 2>&1 || true
+    return 0
   fi
+  "$herdr_bin" notification show "Sidebar close cancelled" \
+    --body "The pane did not acknowledge a safe shutdown; try again shortly." \
+    --position bottom-right --sound none >/dev/null 2>&1 || true
+  return 1
 }
 
 case "$decision" in
@@ -158,12 +159,13 @@ case "$decision" in
     ;;
   "CLOSE "*)
     pid="${decision#CLOSE }"
-    if [ -n "$tab" ]; then
-      mkdir -p "$snooze_dir" 2>/dev/null
-      : > "$snooze_dir/${tab//:/_}"
+    if graceful_close "$pid"; then
+      if [ -n "$tab" ]; then
+        mkdir -p "$snooze_dir" 2>/dev/null
+        : > "$snooze_dir/${tab//:/_}"
+      fi
+      remember_sidebar off
     fi
-    graceful_close "$pid"
-    remember_sidebar off
     ;;
   "REPLACE "*)
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.

@@ -17,8 +17,11 @@ keys, and settings.
 Requires herdr 0.8 or newer.
 
 ```
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
+herdr plugin install Cainiaooo/herdr-sidebar/plugins/herdr-sidebar --yes
 ```
+
+(`--yes` when stdin is not a TTY.) That is this fork, not the public
+`alexarthurs/herdr-sidebar` install.
 
 or from a local checkout:
 
