@@ -114,9 +114,20 @@ if [ -n "$panes" ]; then
 fi
 
 # Snooze markers keep the auto-ensure hook from reopening a sidebar the user
-# toggled closed; toggling open clears the tab's marker again.
+# toggled closed; toggling open clears the tab's marker again. Hide/open also
+# records a durable per-workspace preference (keyed by workspace label).
 snooze_dir="${TMPDIR:-/tmp}/herdr-sidebar-snooze"
 tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)"
+
+remember_sidebar() {
+  local vis=$1
+  local ws_id
+  ws_id="$(printf '%s' "$panes" | "$bin" --focused-workspace 2>/dev/null || true)"
+  [ -n "$ws_id" ] || return 0
+  local list
+  list="$("$herdr_bin" workspace list --json 2>/dev/null || true)"
+  printf '%s' "$list" | "$bin" --remember-sidebar "$vis" "$ws_id" >/dev/null 2>&1 || true
+}
 
 graceful_close() {
   local pane_id=$1 listed present acknowledged=""
@@ -143,6 +154,7 @@ case "$decision" in
     pid="${decision#FOCUS }"
     "$herdr_bin" pane zoom "$pid" --on >/dev/null 2>&1 || true
     "$herdr_bin" pane zoom "$pid" --off
+    remember_sidebar on
     ;;
   "CLOSE "*)
     pid="${decision#CLOSE }"
@@ -151,6 +163,7 @@ case "$decision" in
       : > "$snooze_dir/${tab//:/_}"
     fi
     graceful_close "$pid"
+    remember_sidebar off
     ;;
   "REPLACE "*)
     # Dead pane (stale heartbeat): close the corpse, then dock a fresh one.
@@ -158,9 +171,11 @@ case "$decision" in
     "$herdr_bin" pane close "$pid" >/dev/null 2>&1 || true
     panes="$("$herdr_bin" pane list 2>/dev/null || true)"
     open_pane
+    remember_sidebar on
     ;;
   *)
     [ -n "$tab" ] && rm -f "$snooze_dir/${tab//:/_}" 2>/dev/null
     open_pane
+    remember_sidebar on
     ;;
 esac

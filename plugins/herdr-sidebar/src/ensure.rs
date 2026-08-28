@@ -54,12 +54,6 @@ use crate::snooze;
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
 pub fn run(toggle: bool) -> std::io::Result<()> {
     let state = crate::state::load_state();
-    // Auto-open off (⚙ Settings): hooks leave closed tabs alone; the user's
-    // explicit toggle still works. The unix hook script makes the same check
-    // via `herdr-sidebar --auto-open`.
-    if !toggle && !state.auto_open {
-        return Ok(());
-    }
     let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
     let wait_for_lock = must_wait_for_lock(toggle, &event_json);
     let Some(_lock) = Lock::acquire(wait_for_lock) else {
@@ -76,7 +70,10 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     } else {
         launch::event_scope(&event_json)
     };
-    let tab = snooze_tab_for_scope(&panes, &scope);
+    // Hide/`b` and the open-sidebar toggle record a per-workspace preference
+    // that outranks the global Auto-open default. Quiet hooks never write it.
+    let auto = toggle || workspace_should_auto_open(&state, &panes, &scope);
+    let tab = launch::snooze_tab(&event_json, &panes, &scope);
     let snooze_dir = snooze::dir();
     snooze::sweep(&snooze_dir, &launch::live_tabs(&panes));
     let now = crate::state::unix_now();
@@ -89,8 +86,10 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
                     // the same mapping from the --launch-decision CLI mode.
                     graceful_close(id);
                     snooze::set(&snooze_dir, &tab);
+                    remember_scope(&panes, &scope, false);
                 } else {
                     focus(id)?;
+                    remember_scope(&panes, &scope, true);
                 }
             }
         }
@@ -98,17 +97,26 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
             if toggle {
                 graceful_close(id);
                 snooze::set(&snooze_dir, &tab);
+                remember_scope(&panes, &scope, false);
             }
         }
         Some(("REPLACE", id)) => {
-            // A dead pane (stale heartbeat): close it and dock a fresh one,
-            // quiet or toggle alike — a corpse should never block the dock.
+            // A dead pane (stale heartbeat): close it. Quiet mode only
+            // redocks when this workspace still wants a sidebar — otherwise
+            // a corpse in a hidden Perforce space would come back on the
+            // next pane.focused (which has no tab_id, so tab snooze misses).
             ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }))?;
+            if !auto {
+                return Ok(());
+            }
             // Closing a focused corpse changes focus and invalidates its pane
             // id. Re-plan from a fresh snapshot rather than splitting a pane
             // that no longer exists.
             panes = ipc::call_text("pane.list", serde_json::json!({}))?;
             open(&panes, toggle && state.focus_on_open, &scope)?;
+            if toggle {
+                remember_scope(&panes, &scope, true);
+            }
         }
         _ => {
             if toggle {
@@ -116,12 +124,33 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
                 // "Focus on open: off" (⚙ Settings) docks in the background:
                 // open()'s quiet path already hands focus back after the swap.
                 open(&panes, state.focus_on_open, &scope)?;
-            } else if !snooze::is_set(&snooze_dir, &tab) {
+                remember_scope(&panes, &scope, true);
+            } else if auto && !snooze::is_set(&snooze_dir, &tab) {
                 open(&panes, false, &scope)?;
             }
         }
     }
     Ok(())
+}
+
+fn workspace_should_auto_open(
+    state: &crate::state::State,
+    panes: &str,
+    scope: &str,
+) -> bool {
+    let workspace_id = launch::workspace_id_from_scope(scope, panes);
+    let label = ipc::call_text("workspace.list", serde_json::json!({}))
+        .map(|json| launch::workspace_label(&json, &workspace_id))
+        .unwrap_or_default();
+    crate::state::should_auto_open_workspace(state.auto_open, &label, &workspace_id)
+}
+
+fn remember_scope(panes: &str, scope: &str, visible: bool) {
+    let workspace_id = launch::workspace_id_from_scope(scope, panes);
+    let label = ipc::call_text("workspace.list", serde_json::json!({}))
+        .map(|json| launch::workspace_label(&json, &workspace_id))
+        .unwrap_or_default();
+    crate::state::remember_visible(&label, &workspace_id, visible);
 }
 
 fn graceful_close(pane_id: &str) {
@@ -151,16 +180,6 @@ fn graceful_close(pane_id: &str) {
                 "sound": "none",
             }),
         );
-    }
-}
-
-fn snooze_tab_for_scope(panes_json: &str, scope: &str) -> String {
-    if scope.contains(':') {
-        scope.to_string()
-    } else if scope.is_empty() {
-        launch::focused_tab(panes_json)
-    } else {
-        String::new()
     }
 }
 
@@ -322,17 +341,6 @@ mod tests {
         assert!(!snooze::is_set(&dir, "w1:t2"));
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn workspace_events_do_not_borrow_the_globally_focused_tabs_snooze() {
-        let panes = r#"{"result":{"panes":[
-            {"pane_id":"w1:p1","tab_id":"w1:t1","focused":true},
-            {"pane_id":"w2:p1","tab_id":"w2:t1"}
-        ]}}"#;
-        assert_eq!(snooze_tab_for_scope(panes, ""), "w1:t1");
-        assert_eq!(snooze_tab_for_scope(panes, "w2:t1"), "w2:t1");
-        assert_eq!(snooze_tab_for_scope(panes, "w2"), "");
     }
 
     #[test]

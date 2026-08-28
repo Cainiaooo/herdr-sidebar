@@ -91,8 +91,10 @@ A real tree, not a directory dump:
   the file to the OS-associated app, like a double click in the file manager), Stage
   Changes, Rename, Delete, Copy Path / Relative Path, Reveal in File Explorer.
 - Dotfiles toggle, live refresh, and a hide command when you want the columns back.
-- Prefer the sidebar closed? Toggle "Auto-open sidebar" off in ⚙ Settings and it stays
-  closed until you invoke the open-sidebar action yourself.
+- Prefer the sidebar closed in some spaces (e.g. Perforce) and open in others (Git)?
+  Hide with `b` / `«` or toggle it closed — that workspace is remembered off.
+  Toggle it open and that workspace is remembered on. ⚙ "Auto-open (new spaces)" is
+  only the default for workspaces you have not shown or hidden yet.
 - Want one key to mean open/close? "Strict toggle" in ⚙ Settings closes an open sidebar
   even when it isn't focused, and "Focus on open" off docks it in the background so
   focus stays in the pane you toggled from.
@@ -233,21 +235,24 @@ overwrite or reload decision at save time.
 | `open-git` / `open-git-windows` | Toggle a separate Source Control pane (separated mode) |
 | `redeploy` / `redeploy-windows` | After a rebuild: refresh every workspace onto the new build |
 
-Pressing `b` inside the plugin hides that tab's sidebar and snoozes auto-open there. To
-show it again, invoke `open-sidebar` (`open-sidebar-windows` on Windows) from another pane.
-Herdr's built-in `prefix+b` controls Herdr's own sidebar unless you bind it to the plugin
-action in `config.toml`:
+Pressing `b` inside the plugin hides that tab's sidebar, snoozes auto-open there, and
+remembers the **workspace** as hidden so a later click on another pane (Perforce, shell)
+does not bring it back. Toggle it open again and that workspace is remembered as shown.
+
+Herdr's built-in `prefix+b` (`Ctrl+b` then `b`) toggles **Herdr's own** workspace/agent
+sidebar, not this plugin. Bind a different chord — do not steal `prefix+b` unless you
+want that:
 
 ```toml
 [[keys.command]]
-key = "prefix+b"
+key = "prefix+shift+b"
 type = "shell"
 command = "herdr plugin action invoke open-sidebar-windows --plugin herdr-sidebar" # Windows
 description = "toggle herdr-sidebar"
 ```
 
 Use `open-sidebar` instead of `open-sidebar-windows` on Linux or macOS, then run
-`herdr server reload-config`.
+`herdr server reload-config`. You can also run that invoke from any pane.
 
 ## Under the hood
 

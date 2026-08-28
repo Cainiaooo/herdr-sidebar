@@ -23,7 +23,9 @@ cargo build --release
 herdr plugin link .
 ```
 
-Open it (or just focus a tab — the hook docks it):
+Open it (or just focus a tab — the hook docks it). Herdr's `Ctrl+b b` is **not**
+this plugin; it toggles Herdr's own sidebar. Use the action, or bind e.g.
+`prefix+shift+b` in `config.toml` (see the repo README):
 
 ```
 herdr plugin action invoke herdr-sidebar.open-sidebar-windows   # windows

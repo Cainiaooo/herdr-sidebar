@@ -13,10 +13,18 @@ bin_dir="$script_dir/../target/release"
 bin="$bin_dir/herdr-sidebar"
 [ -x "$bin" ] || exit 0
 
-# "Auto-open sidebar: off" (⚙ Settings): hooks leave closed tabs alone; only
-# the explicit open-sidebar toggle docks one (issue #8). Checked before the
+# Per-workspace hide/toggle outranks ⚙ Settings → Auto-open sidebar.
+# Unknown spaces follow the global default (issue #8). Checked before the
 # lock so a disabled hook never contends with a user toggle.
-[ "$("$bin" --auto-open 2>/dev/null || echo on)" = "off" ] && exit 0
+scope="$("$bin" --event-scope 2>/dev/null || true)"
+ws_id="${scope%%:*}"
+ws_list="$("$herdr_bin" workspace list --json 2>/dev/null || true)"
+if [ -n "$ws_id" ]; then
+  should="$(printf '%s' "$ws_list" | "$bin" --should-auto-open "$ws_id" 2>/dev/null || echo on)"
+else
+  should="$("$bin" --auto-open 2>/dev/null || echo on)"
+fi
+[ "$should" = "off" ] && exit 0
 
 # Focus events arrive in bursts and concurrent ensures each open an explorer —
 # serialize with an atomic mkdir lock. Focus events may skip a held lock because
@@ -55,7 +63,7 @@ panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 # you came from during a workspace switch, which rooted new sidebars in the
 # wrong project. Everything below reasons about this one scope — decision,
 # snooze check, and spawn cwd must agree or we dock into the wrong tab.
-scope="$("$bin" --event-scope 2>/dev/null || true)"
+# (`scope` was already read from the event payload before the lock.)
 
 decision="$(printf '%s' "$panes" | "$bin" --launch-decision "" "$scope" 2>/dev/null || true)"
 replacing="false"
@@ -75,14 +83,10 @@ esac
 
 # Respect a tab the user toggled closed (open-explorer.sh writes the marker) —
 # otherwise the very next focus event would reopen what they just closed.
+# pane.focused has no tab_id; --snooze-tab locates the pane's tab so a click
+# on Perforce/shell in the same tab still honors hide.
 snooze_dir="${TMPDIR:-/tmp}/herdr-sidebar-snooze"
-# A scope containing ':' IS a tab id (w4:tY). An empty scope falls back to the
-# focused tab for legacy events; a workspace scope has no tab snooze to borrow.
-case "$scope" in
-  *:*) tab="$scope" ;;
-  "")  tab="$(printf '%s' "$panes" | "$bin" --focused-tab 2>/dev/null || true)" ;;
-  *)   tab="" ;;
-esac
+tab="$(printf '%s' "$panes" | "$bin" --snooze-tab "$scope" 2>/dev/null || true)"
 if [ "$replacing" != "true" ] && [ -n "$tab" ] && [ -f "$snooze_dir/${tab//:/_}" ]; then
   exit 0
 fi

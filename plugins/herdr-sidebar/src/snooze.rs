@@ -31,6 +31,22 @@ pub fn is_set(dir: &std::path::Path, tab: &str) -> bool {
     !tab.is_empty() && marker(dir, tab).exists()
 }
 
+/// Hide this sidebar pane: snooze its tab, remember the workspace as
+/// "don't auto-dock", then close the pane. Shared by Explorer and Source
+/// Control so `b` / `«` cannot drift.
+pub fn hide_pane(pane_id: &str) {
+    if let Ok(panes) = crate::ipc::call_text("pane.list", serde_json::json!({})) {
+        set(&dir(), &crate::launch::tab_of(&panes, pane_id));
+        let list = crate::ipc::call_text("workspace.list", serde_json::json!({}))
+            .unwrap_or_default();
+        crate::state::remember_visible_for_pane(&panes, &list, pane_id, false);
+    }
+    let _ = crate::ipc::call_text(
+        "pane.close",
+        serde_json::json!({ "pane_id": pane_id }),
+    );
+}
+
 pub fn sweep(dir: &std::path::Path, live_tabs: &std::collections::BTreeSet<String>) {
     let live: std::collections::BTreeSet<String> =
         live_tabs.iter().map(|t| t.replace(':', "_")).collect();
