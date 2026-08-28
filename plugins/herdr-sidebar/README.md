@@ -1,5 +1,9 @@
 # herdr-sidebar
 
+**Fork of this plugin** — see [`docs/FORK.md`](../../docs/FORK.md) and
+[`docs/CHANGELOG.md`](../../docs/CHANGELOG.md). Link **this** checkout; do not
+reinstall `alexarthurs/herdr-sidebar`.
+
 **The sidebar your terminal was missing** — a VS Code-inspired file explorer + source
 control panel in one dockable herdr pane.
 

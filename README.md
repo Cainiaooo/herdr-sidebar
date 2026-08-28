@@ -1,3 +1,9 @@
+> **Fork.** This tree is [Cainiaooo/herdr-sidebar](https://github.com/Cainiaooo/herdr-sidebar),
+> not the public [alexarthurs/herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar)
+> install. How we use and sync it: [`docs/FORK.md`](docs/FORK.md). What we changed:
+> [`docs/CHANGELOG.md`](docs/CHANGELOG.md). Do not `git push` to upstream; do not
+> `herdr plugin install alexarthurs/...` on this machine.
+
 <div align="center">
 
 # Herdr Sidebar

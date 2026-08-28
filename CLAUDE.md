@@ -1,5 +1,11 @@
 # herdr-sidebar monorepo
 
+**This checkout is Cainiaooo's fork.** `origin` = `Cainiaooo/herdr-sidebar`,
+`upstream` = `alexarthurs/herdr-sidebar`. Never push `upstream`. herdr is
+`plugin link`'d to `plugins/herdr-sidebar` in this tree — do not
+`herdr plugin install alexarthurs/...`. Usage: `docs/FORK.md`. Our delta:
+`docs/CHANGELOG.md`.
+
 **This file is a living doc — always capture findings.** Whenever you discover something
 non-obvious the hard way (a herdr behavior, a Windows quirk, a manifest gotcha, a build issue),
 record it here in the relevant section before finishing the task, the way the Windows caveats
