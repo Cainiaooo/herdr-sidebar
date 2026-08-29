@@ -431,7 +431,8 @@ HACKING.md — budget time for that before promising a patched build.
 - The sticky setting lives in `HERDR_PLUGIN_STATE_DIR/state.json` (resolves to
   `%LOCALAPPDATA%\herdr\plugins\herdr-sidebar\` here) per the herdr plugin docs; herdr
   injects that env for hooks/actions but NOT panes, so every `pane.split` we issue
-  forwards it via the `env` param (`state::spawn_env`). Legacy
+  forwards it via the `env` param (`state::spawn_env`) along with
+  `HERDR_PLUGIN_CONFIG_DIR` (commit-message generator). Legacy
   `%APPDATA%\herdr\aa-sidebar.json` is migrated on first load. A fresh sidebar opens on
   the last-active view.
 - **Per-workspace visibility** lives in `visibility.json` next to `state.json`, keyed
@@ -577,6 +578,23 @@ HACKING.md — budget time for that before promising a patched build.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
+- **✧ commit-message generator** (`src/suggest.rs`, fork issue #1): user-level
+  `commit-message.toml` in Herdr's plugin **config** dir (`HERDR_PLUGIN_CONFIG_DIR`;
+  Windows `%APPDATA%\herdr\plugins\config\herdr-sidebar\`). Herdr injects that env
+  for hooks/actions but NOT panes, so `spawn_env()` forwards it and falls back to
+  the conventional path — reading only the env var would leave sparkle on the
+  built-in Claude default forever. **Never** load generator config from the
+  workspace, git repo, cwd, parent dirs, plugin **state** dir (`state.json`), or
+  the example shipped in `docs/examples/` unless the user copied it. `command` is
+  an argv array (`Command::new(argv[0]).args(&argv[1..])`), no shell string. The
+  child inherits the user environment (Claude/Codex/Grok auth) minus `HERDR_*`
+  control variables; v1 does not add secrets from the TOML. No file → built-in
+  `claude -p --model haiku --strict-mcp-config` plus the historical English
+  prompt, filename fallback, empty Commit is still a no-op (`auto_on_empty_commit`
+  default `off`). Invalid / oversize / unknown-placeholder config fails closed
+  (flash + fallback, no guessed binary). Sparkle / `A` only fills the box; Settings
+  shows a read-only summary (`built-in: claude haiku` when unset). Switch profiles
+  by editing the TOML, not `state.json`.
 - Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
   like Explorer decorations. Suggestion/sync worker results are still collected first so a
   hidden pane never strands completed background work.

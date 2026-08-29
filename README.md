@@ -127,9 +127,14 @@ Everything you reach for in an editor's source-control panel, in a terminal pane
   branches and tags in the history drawers open the same way.
 - **Stage, unstage, discard, commit** — by key or click, with Staged/Changes sections,
   count badges, and familiar per-file status letters.
-- **✧ AI commit messages** — the sparkle button sends the pending diff to your local
-  `claude` CLI and drops a drafted subject line into the message box. No claude? A clean
-  filename-based fallback kicks in. Never blocks the UI.
+- **✧ AI commit messages** — the sparkle button runs a **user-configured Agent CLI
+  oneshot** (Claude, Codex, Grok, or any argv you trust) and drops a drafted subject
+  line into the message box. Never commits by itself. No config file → the built-in
+  Claude haiku oneshot. Copy
+  [`docs/examples/commit-message.toml`](docs/examples/commit-message.toml) to
+  `%APPDATA%\herdr\plugins\config\herdr-sidebar\commit-message.toml` (unix:
+  `$XDG_CONFIG_HOME/herdr/plugins/config/herdr-sidebar/`) to switch CLIs. Missing
+  CLI or a failed oneshot falls back to a filename heuristic. Never blocks the UI.
 - **Sync Changes** — a `⇅ 1↑ 2↓` button appears when you're ahead/behind upstream; one
   press runs `pull --rebase --autostash` + `push` in the background.
 - **Multi-repo** — child repositories are auto-discovered, each with its
@@ -191,8 +196,9 @@ winget install DEVCOM.JetBrainsMonoNerdFont
 ```
 
 (or any font from [nerdfonts.com](https://www.nerdfonts.com/font-downloads), e.g.
-CaskaydiaCove). Also recommended: the
-[`claude` CLI](https://claude.com/claude-code) for ✧ commit messages.
+CaskaydiaCove). ✧ commit messages need an Agent CLI on `PATH` only if you use
+one — copy [`docs/examples/commit-message.toml`](docs/examples/commit-message.toml)
+into the user plugin config dir and set `command` to that CLI's argv.
 
 ## Keys
 

@@ -140,4 +140,5 @@ recorded in `CHANGELOG.md`.
 | Windows ensure/toggle | `plugins/herdr-sidebar/src/ensure.rs` |
 | Hide (`b`) | `plugins/herdr-sidebar/src/snooze.rs` `hide_pane` |
 | Unix ensure/toggle | `scripts/ensure-sidebar.sh`, `scripts/open-sidebar.sh` |
-| Tests | `state::workspace_visibility_*`, `launch::pane_focused_events_*` |
+| ✧ commit-message generator | `plugins/herdr-sidebar/src/suggest.rs`; config `%APPDATA%\herdr\plugins\config\herdr-sidebar\commit-message.toml` (never `state.json`, never the repo) |
+| Tests | `state::workspace_visibility_*`, `launch::pane_focused_events_*`, `suggest::*` |

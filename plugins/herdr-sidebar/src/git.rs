@@ -46,6 +46,33 @@ pub struct Staged {
     pub skipped_nested: usize,
 }
 
+/// Which patch [`Git::diff_for_message`] described — the `{source}` placeholder
+/// in a commit-message generator prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffSource {
+    Staged,
+    Worktree,
+    Untracked,
+}
+
+impl DiffSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Worktree => "worktree",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+/// Pending change set a commit-message generator should describe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageDiff {
+    pub diff: String,
+    pub files: Vec<String>,
+    pub source: DiffSource,
+}
+
 impl Git {
     /// Locate the repository containing `dir`; Err with git's message when there
     /// is none (or git itself is missing).
@@ -187,14 +214,19 @@ impl Git {
     /// when something is staged (that is what would be committed), else the
     /// working-tree diff. Untracked files only appear as names, so they ride
     /// along in the returned path list either way.
-    pub fn diff_for_message(&self) -> Result<(String, Vec<String>), String> {
+    pub fn diff_for_message(&self) -> Result<MessageDiff, String> {
         let staged = run_in(&self.root, &["diff", "--cached", "--stat", "--patch"])?;
-        let (diff, names_args): (String, &[&str]) = if staged.trim().is_empty() {
-            let unstaged = run_in(&self.root, &["diff", "--stat", "--patch"])?;
-            (unstaged, &["diff", "--name-only"])
-        } else {
-            (staged, &["diff", "--cached", "--name-only"])
-        };
+        let (diff, names_args, mut source): (String, &[&str], DiffSource) =
+            if staged.trim().is_empty() {
+                let unstaged = run_in(&self.root, &["diff", "--stat", "--patch"])?;
+                (unstaged, &["diff", "--name-only"], DiffSource::Worktree)
+            } else {
+                (
+                    staged,
+                    &["diff", "--cached", "--name-only"],
+                    DiffSource::Staged,
+                )
+            };
         let mut files: Vec<String> = run_in(&self.root, names_args)?
             .lines()
             .map(str::to_string)
@@ -207,8 +239,13 @@ impl Git {
                 .map(str::to_string)
                 .filter(|l| !l.is_empty())
                 .collect();
+            source = DiffSource::Untracked;
         }
-        Ok((diff, files))
+        Ok(MessageDiff {
+            diff,
+            files,
+            source,
+        })
     }
 
     /// Repo-relative roots of ignored paths, for the Explorer's `Ignored`
@@ -686,6 +723,41 @@ mod tests {
         names.sort();
         assert_eq!(names, ["a", "b"]);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn message_diff_prefers_staged_then_worktree_then_untracked() {
+        let git = repo_with_head("msgdiff");
+        std::fs::write(git.root.join("u.txt"), "u").unwrap();
+        let m = git.diff_for_message().unwrap();
+        assert_eq!(m.source, DiffSource::Untracked);
+        assert!(m.files.iter().any(|f| f == "u.txt"));
+
+        std::fs::write(git.root.join("t.txt"), "1").unwrap();
+        run_in(&git.root, &["add", "t.txt"]).unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "t",
+            ])
+            .current_dir(&git.root)
+            .output()
+            .unwrap();
+        std::fs::write(git.root.join("t.txt"), "2").unwrap();
+        let m = git.diff_for_message().unwrap();
+        assert_eq!(m.source, DiffSource::Worktree);
+        assert!(m.files.iter().any(|f| f == "t.txt"));
+
+        run_in(&git.root, &["add", "t.txt"]).unwrap();
+        let m = git.diff_for_message().unwrap();
+        assert_eq!(m.source, DiffSource::Staged);
+        assert!(m.diff.contains("t.txt"));
     }
 
     /// A fresh repo with one commit on `main`, so HEAD resolves.

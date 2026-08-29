@@ -33,7 +33,9 @@ pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
     if wider {
         (width + SIDEBAR_WIDTH_STEP).min(MAX_SIDEBAR_WIDTH)
     } else {
-        width.saturating_sub(SIDEBAR_WIDTH_STEP).max(MIN_SIDEBAR_WIDTH)
+        width
+            .saturating_sub(SIDEBAR_WIDTH_STEP)
+            .max(MIN_SIDEBAR_WIDTH)
     }
 }
 
@@ -264,15 +266,50 @@ fn state_dir() -> Option<PathBuf> {
     Some(base?.join("herdr").join("plugins").join("herdr-sidebar"))
 }
 
+/// User-level plugin config directory (`HERDR_PLUGIN_CONFIG_DIR`). Herdr injects
+/// that env for hooks/actions but NOT panes, so [`spawn_env`] forwards it the
+/// same way as the state dir. Generator config (`commit-message.toml`) is read
+/// only from here — never from the workspace, git repo, or [`state_dir`].
+pub fn plugin_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    conventional_plugin_config_dir()
+}
+
+fn conventional_plugin_config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    Some(
+        base?
+            .join("herdr")
+            .join("plugins")
+            .join("config")
+            .join("herdr-sidebar"),
+    )
+}
+
 /// Env for panes WE spawn. Panes don't inherit the hook/action env herdr
-/// injects, so forward the state dir and prepend the directory containing
-/// our executable to PATH. Launchers can then type the same bare command in
-/// every configured shell without quoting an absolute path.
+/// injects, so forward the state dir, the user config dir, and prepend the
+/// directory containing our executable to PATH. Launchers can then type the
+/// same bare command in every configured shell without quoting an absolute path.
 pub fn spawn_env() -> serde_json::Value {
     let mut env = serde_json::Map::new();
     if let Some(dir) = state_dir() {
         env.insert(
             "HERDR_PLUGIN_STATE_DIR".into(),
+            serde_json::Value::String(dir.display().to_string()),
+        );
+    }
+    if let Some(dir) = plugin_config_dir() {
+        env.insert(
+            "HERDR_PLUGIN_CONFIG_DIR".into(),
             serde_json::Value::String(dir.display().to_string()),
         );
     }
@@ -662,10 +699,7 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
         .is_some_and(|json| std::fs::write(path, json).is_ok())
 }
 
-fn merge_scm_drafts(
-    stored: &mut std::collections::BTreeMap<String, String>,
-    state: &ScmState,
-) {
+fn merge_scm_drafts(stored: &mut std::collections::BTreeMap<String, String>, state: &ScmState) {
     for root in &state.cleared_drafts {
         stored.remove(root);
     }
@@ -799,7 +833,9 @@ pub fn remember_visible(label: &str, workspace_id: &str, visible: bool) {
     if key.is_empty() {
         return;
     }
-    let Some(path) = visibility_path() else { return };
+    let Some(path) = visibility_path() else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -970,7 +1006,10 @@ mod tests {
         assert_eq!(state.drawers, vec!["CHANGES"]);
         assert_eq!(state.active_root.as_deref(), Some("C:/repo"));
         assert_eq!(state.scroll, 4);
-        assert_eq!(state.drafts.get("C:/repo").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            state.drafts.get("C:/repo").map(String::as_str),
+            Some("keep me")
+        );
         assert_eq!(scm_path_key(Path::new(r"C:\repo\src")), "C:/repo/src");
     }
 
@@ -981,9 +1020,7 @@ mod tests {
             ("/repo/b".to_string(), "draft to clear".to_string()),
         ]);
         let mut state = ScmState::default();
-        state
-            .cleared_drafts
-            .insert("/repo/b".to_string());
+        state.cleared_drafts.insert("/repo/b".to_string());
 
         merge_scm_drafts(&mut stored, &state);
 
@@ -1060,8 +1097,14 @@ mod tests {
     fn sidebar_width_steps_and_saturates_within_supported_bounds() {
         assert_eq!(step_sidebar_width(32, true), 36);
         assert_eq!(step_sidebar_width(32, false), 28);
-        assert_eq!(step_sidebar_width(MAX_SIDEBAR_WIDTH, true), MAX_SIDEBAR_WIDTH);
-        assert_eq!(step_sidebar_width(MIN_SIDEBAR_WIDTH, false), MIN_SIDEBAR_WIDTH);
+        assert_eq!(
+            step_sidebar_width(MAX_SIDEBAR_WIDTH, true),
+            MAX_SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            step_sidebar_width(MIN_SIDEBAR_WIDTH, false),
+            MIN_SIDEBAR_WIDTH
+        );
         assert_eq!(step_sidebar_width(1, true), 28);
         assert_eq!(step_sidebar_width(u16::MAX, false), 76);
     }
@@ -1113,5 +1156,29 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(first, std::env::current_exe().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn spawn_env_forwards_plugin_config_dir() {
+        let env = spawn_env();
+        let got = env
+            .get("HERDR_PLUGIN_CONFIG_DIR")
+            .and_then(|v| v.as_str())
+            .expect("HERDR_PLUGIN_CONFIG_DIR must be forwarded so pane TUIs see generator config");
+        if let Ok(from_env) = std::env::var("HERDR_PLUGIN_CONFIG_DIR")
+            && !from_env.is_empty()
+        {
+            assert_eq!(got, from_env);
+            return;
+        }
+        let normalized = got.replace('\\', "/");
+        assert!(
+            normalized.ends_with("herdr/plugins/config/herdr-sidebar"),
+            "conventional fallback, got {got}"
+        );
+        assert!(
+            !normalized.contains("herdr/plugins/herdr-sidebar/commit-message"),
+            "config dir must not be the state dir"
+        );
     }
 }

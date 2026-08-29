@@ -1,0 +1,56 @@
+# Example commit-message generator config for herdr-sidebar.
+#
+# THIS FILE IS NOT LOADED FROM THE REPO. Copy it to Herdr's user plugin config
+# directory, then edit the argv to match the Agent CLI you actually have:
+#
+#   Windows: %APPDATA%\herdr\plugins\config\herdr-sidebar\commit-message.toml
+#   macOS/Linux: ${XDG_CONFIG_HOME:-~/.config}/herdr/plugins/config/herdr-sidebar/commit-message.toml
+#
+# Trust boundary: the plugin reads ONLY that path. A commit-message.toml (or
+# .herdr-sidebar.toml) sitting in a git repo, parent directory, or plugin state
+# dir is ignored on purpose.
+#
+# `command` is an argv array spawned directly — never a shell string.
+# Grok, Agy, and other CLIs work the same way: put THEIR argv here. Do not
+# invent flags you have not verified against that CLI.
+
+[commit_message]
+enabled = true
+default_profile = "claude"
+# off          — empty Commit is a no-op (historical default)
+# fill         — empty Commit runs the oneshot, fills the box, waits for a second click
+# fill_and_commit — after a successful generate, commit immediately (never on failure)
+auto_on_empty_commit = "fill"
+fallback = "filenames" # filenames | none
+
+# Claude Code oneshot (matches the built-in default when this file is absent).
+[commit_message.profiles.claude]
+command = ["claude", "-p", "--model", "haiku", "--strict-mcp-config"]
+# Optional Windows-only argv if CreateProcess cannot launch command[0]:
+# command_windows = ["claude.cmd", "-p", "--model", "haiku", "--strict-mcp-config"]
+input = "prompt_argv_diff_stdin"
+timeout_seconds = 60
+max_diff_bytes = 16384
+max_output_bytes = 4096
+cwd = "repo"                # repo | workspace
+output = "last_usable_line" # last_usable_line | raw_trim
+prompt = """
+Write a git commit message for the diff on stdin: one imperative subject line under 72 characters, no quotes, no trailing period. Reply with ONLY the message line.
+"""
+
+# Codex-shaped stdin oneshot. `codex exec -` reads the prompt (and diff) from stdin.
+# Verify `codex exec` flags against your installed Codex before relying on this.
+[commit_message.profiles.codex]
+command = ["codex", "exec", "-"]
+input = "prompt_and_diff_stdin"
+timeout_seconds = 120
+max_diff_bytes = 32768
+prompt = """
+Write a git commit message for this diff. One imperative subject line under 72 characters. Reply with ONLY the message line.
+
+{diff}
+"""
+
+# Prompt placeholders (closed set; unknown {…} invalidates the whole file):
+#   {diff} {files} {files_csv} {file_count} {branch} {repo_root} {source}
+# argv_subst may use {prompt_file} / {diff_file} in `command` only.
