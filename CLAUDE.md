@@ -492,7 +492,9 @@ HACKING.md — budget time for that before promising a patched build.
   `m / ctrl+rclick: menu` — same width as the old `ctrl+rclick for menus`, so it still
   fits a ~34-col pane.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
-  then type text instead of triggering actions (Esc returns to the list).
+  then type text instead of triggering actions (Esc returns to the list). A saved/wheel
+  `scroll` in `scm.json` can also hide Staged/Changes above the drawer list; load and
+  sparkle-fill now snap the list back if the file sections would be entirely off-screen.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO

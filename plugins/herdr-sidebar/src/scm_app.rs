@@ -719,7 +719,28 @@ impl App {
             app.selected = Some(i);
         }
         app.scroll = saved_scroll.min(app.rows.len().saturating_sub(1));
+        app.reveal_changes_if_hidden();
         app
+    }
+
+    /// If a saved scroll starts past every file-section row, Staged/Changes
+    /// sit above the viewport (under the drawers) and there is no obvious
+    /// way to stage. Snap back so the file lists are on screen.
+    fn reveal_changes_if_hidden(&mut self) {
+        let last_file = self.rows.iter().rposition(|row| {
+            matches!(
+                row,
+                Row::StagedHeader(_)
+                    | Row::ChangesHeader(_)
+                    | Row::Staged(_, _)
+                    | Row::Unstaged(_, _)
+            )
+        });
+        if let Some(last) = last_file
+            && self.scroll > last
+        {
+            self.scroll = 0;
+        }
     }
 
     pub fn root_path(&self) -> &Path {
@@ -859,12 +880,17 @@ impl App {
         if let Some(rx) = &self.suggesting {
             match rx.try_recv() {
                 Ok(outcome) => {
-                    if let Some(message) = outcome.message
-                        && let Some(repo) = self.active_repo_mut()
-                    {
-                        repo.message = message.chars().collect();
-                        repo.cursor = repo.message.len();
+                    if let Some(message) = outcome.message {
+                        if let Some(repo) = self.active_repo_mut() {
+                            repo.message = message.chars().collect();
+                            repo.cursor = repo.message.len();
+                        }
                         self.focus = Focus::Message;
+                        // Sparkle leaves list-focus behind; a restored/wheel
+                        // scroll can have Staged/Changes sitting above the
+                        // viewport under the drawers.
+                        self.scroll = 0;
+                        self.persist_scm();
                     }
                     let then_commit = self.suggest_then_commit;
                     self.suggest_then_commit = false;
