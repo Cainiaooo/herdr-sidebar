@@ -414,6 +414,7 @@ enum Setting {
     FollowCwd,
     GitDecorations,
     Hotkeys,
+    CommitMessage,
     Folder,
 }
 
@@ -561,7 +562,10 @@ pub struct App {
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
     /// Pending ✧ commit-message generation, polled from tick().
-    suggesting: Option<Receiver<String>>,
+    suggesting: Option<Receiver<suggest::SuggestOutcome>>,
+    /// After a successful generate, immediately `git commit` (fill_and_commit).
+    /// Sparkle / `A` always leave this false.
+    suggest_then_commit: bool,
     /// Pending Sync Changes run, polled from tick().
     syncing: Option<Receiver<Result<String, String>>>,
     overlay: Option<Overlay>,
@@ -682,6 +686,7 @@ impl App {
             history_target,
             flash: None,
             suggesting: None,
+            suggest_then_commit: false,
             syncing: None,
             overlay: None,
             hovered: None,
@@ -853,19 +858,34 @@ impl App {
         }
         if let Some(rx) = &self.suggesting {
             match rx.try_recv() {
-                Ok(message) => {
-                    if let Some(repo) = self.active_repo_mut() {
+                Ok(outcome) => {
+                    if let Some(message) = outcome.message
+                        && let Some(repo) = self.active_repo_mut()
+                    {
                         repo.message = message.chars().collect();
                         repo.cursor = repo.message.len();
+                        self.focus = Focus::Message;
                     }
-                    self.focus = Focus::Message;
-                    self.flash = Some(("✧ suggestion ready — edit or ⏎ to commit".into(), false));
+                    let then_commit = self.suggest_then_commit;
+                    self.suggest_then_commit = false;
                     self.suggesting = None;
+                    if outcome.generated {
+                        self.flash =
+                            Some(("✧ suggestion ready — edit or ⏎ to commit".into(), false));
+                        if then_commit {
+                            self.commit_repo(self.active);
+                        }
+                    } else if let Some(error) = outcome.error {
+                        self.flash = Some((error, true));
+                    } else {
+                        self.flash = Some(("✧ generation failed".into(), true));
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.flash = Some(("✧ generation failed".into(), true));
                     self.suggesting = None;
+                    self.suggest_then_commit = false;
                 }
             }
         }
@@ -1136,16 +1156,12 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Backspace => {
-                if repo.cursor > 0 {
-                    repo.cursor -= 1;
-                    repo.message.remove(repo.cursor);
-                }
+            KeyCode::Backspace if repo.cursor > 0 => {
+                repo.cursor -= 1;
+                repo.message.remove(repo.cursor);
             }
-            KeyCode::Delete => {
-                if repo.cursor < repo.message.len() {
-                    repo.message.remove(repo.cursor);
-                }
+            KeyCode::Delete if repo.cursor < repo.message.len() => {
+                repo.message.remove(repo.cursor);
             }
             KeyCode::Left => repo.cursor = repo.cursor.saturating_sub(1),
             KeyCode::Right => repo.cursor = (repo.cursor + 1).min(repo.message.len()),
@@ -1577,14 +1593,12 @@ impl App {
                     Cmd::Nothing
                 }
                 KeyCode::Left | KeyCode::Char('h')
-                    if settings.get(*selected).map(|row| row.0)
-                        == Some(Setting::SidebarWidth) =>
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::SidebarWidth) =>
                 {
                     Cmd::AdjustWidth(false)
                 }
                 KeyCode::Right | KeyCode::Char('l')
-                    if settings.get(*selected).map(|row| row.0)
-                        == Some(Setting::SidebarWidth) =>
+                    if settings.get(*selected).map(|row| row.0) == Some(Setting::SidebarWidth) =>
                 {
                     Cmd::AdjustWidth(true)
                 }
@@ -1842,6 +1856,12 @@ impl App {
                 true,
             ),
             (
+                Setting::CommitMessage,
+                "Commit message",
+                truncate_to(suggest::settings_summary(), 36),
+                false,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.cwd
@@ -1904,6 +1924,7 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.git_deco = !state.git_deco);
             }
+            Setting::CommitMessage => {}
             Setting::Folder => {
                 self.overlay = None;
                 self.change_folder_dialog();
@@ -2436,7 +2457,10 @@ impl App {
             self.persisted_draft_roots
                 .extend(snapshot.drafts.keys().cloned());
         } else {
-            self.flash = Some(("Could not save Source Control state; action cancelled.".into(), true));
+            self.flash = Some((
+                "Could not save Source Control state; action cancelled.".into(),
+                true,
+            ));
         }
         saved
     }
@@ -2677,6 +2701,10 @@ impl App {
 
     /// Kick off ✧ commit-message generation in the background.
     fn suggest_message(&mut self) {
+        self.start_suggest(false);
+    }
+
+    fn start_suggest(&mut self, then_commit: bool) {
         if self.suggesting.is_some() {
             return;
         }
@@ -2684,11 +2712,25 @@ impl App {
             return;
         };
         match repo.git.diff_for_message() {
-            Ok((diff, files)) if diff.trim().is_empty() && files.is_empty() => {
+            Ok(diff) if diff.diff.trim().is_empty() && diff.files.is_empty() => {
                 self.flash = Some(("no changes to describe".into(), true));
             }
-            Ok((diff, files)) => {
-                self.suggesting = Some(suggest::spawn(diff, files));
+            Ok(diff) => {
+                let branch = if repo.status.branch.trim().is_empty() {
+                    "HEAD".to_string()
+                } else {
+                    repo.status.branch.clone()
+                };
+                let request = suggest::SuggestRequest {
+                    diff: diff.diff,
+                    files: diff.files,
+                    source: diff.source,
+                    branch,
+                    repo_root: repo.git.root().to_path_buf(),
+                    workspace: self.cwd.clone(),
+                };
+                self.suggesting = Some(suggest::spawn(request));
+                self.suggest_then_commit = then_commit;
                 self.flash = Some(("✧ generating commit message…".into(), false));
             }
             Err(e) => self.flash = Some((e, true)),
@@ -2725,20 +2767,34 @@ impl App {
     }
 
     fn commit_repo(&mut self, index: usize) {
-        let Some(repo) = self.repos.get_mut(index) else {
-            return;
+        let (message, staged_empty) = {
+            let Some(repo) = self.repos.get(index) else {
+                return;
+            };
+            (
+                repo.message.iter().collect::<String>(),
+                repo.status.staged.is_empty(),
+            )
         };
-        let message: String = repo.message.iter().collect();
         if message.trim().is_empty() {
             self.active = index;
-            self.flash = Some(("Commit message is empty.".to_string(), true));
             self.focus = Focus::Message;
+            match suggest::auto_on_empty_commit() {
+                suggest::AutoOnEmpty::Off => {
+                    self.flash = Some(("Commit message is empty.".to_string(), true));
+                }
+                suggest::AutoOnEmpty::Fill => self.start_suggest(false),
+                suggest::AutoOnEmpty::FillAndCommit => self.start_suggest(true),
+            }
             return;
         }
-        if repo.status.staged.is_empty() {
+        if staged_empty {
             self.flash = Some(("No staged changes to commit.".to_string(), true));
             return;
         }
+        let Some(repo) = self.repos.get_mut(index) else {
+            return;
+        };
         match repo.git.commit(message.trim()) {
             Ok(summary) => {
                 self.flash = Some((summary, false));
@@ -3438,9 +3494,7 @@ impl App {
                 MenuEntry::Action(_, label) => {
                     let line = Line::raw(format!(" {label}"));
                     if i == *selected {
-                        ListItem::new(line).style(
-                            selection_style(true),
-                        )
+                        ListItem::new(line).style(selection_style(true))
                     } else {
                         ListItem::new(line)
                     }

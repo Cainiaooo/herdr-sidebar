@@ -10,6 +10,46 @@ Base: upstream `13ebde8` (after PR #39, 2026-08).
 
 ---
 
+## 2026-08-29 — configurable Agent CLI commit-message oneshot
+
+Fork issue [#1](https://github.com/Cainiaooo/herdr-sidebar/issues/1). Sparkle (`✧` / `A`)
+no longer hardcodes Anthropic Claude Code.
+
+### Added
+
+- User-level generator config: `%APPDATA%\herdr\plugins\config\herdr-sidebar\commit-message.toml`
+  (unix: `$XDG_CONFIG_HOME/herdr/plugins/config/herdr-sidebar/`, else `~/.config/...`).
+  Named profiles, argv `command` (no shell), input modes (`prompt_argv_diff_stdin`,
+  `prompt_and_diff_stdin`, `argv_subst`), prompt placeholders, timeout/size caps,
+  `auto_on_empty_commit` (`off` / `fill` / `fill_and_commit`).
+- Non-loaded example: [`docs/examples/commit-message.toml`](examples/commit-message.toml).
+  Copying it into the user config dir is the only way it takes effect.
+- ⚙ Settings row **Commit message**: read-only summary of the resolved profile
+  (`built-in: claude haiku` when no file). Edit the TOML to switch profiles.
+
+### Changed
+
+- No config file → same as today: `claude -p --model haiku --strict-mcp-config` plus
+  the existing English prompt, filename fallback, empty Commit is a no-op.
+- `state::spawn_env()` forwards `HERDR_PLUGIN_CONFIG_DIR` (herdr injects it for
+  hooks/actions, not panes) and falls back to the conventional user config dir.
+- Generator child inherits the user environment (so Claude/Codex/Grok auth still
+  works) and strips `HERDR_*` control variables before spawn.
+- Invalid / oversize / unknown-placeholder config fails closed: flash the error,
+  use the filename fallback, do not run a guessed binary.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `plugins/herdr-sidebar/src/suggest.rs` | load config, plan argv/stdin, spawn, parse |
+| `plugins/herdr-sidebar/src/state.rs` | `plugin_config_dir()`, forward in `spawn_env()` |
+| `plugins/herdr-sidebar/src/scm_app.rs` | empty-commit fill; Settings summary |
+| `plugins/herdr-sidebar/src/git.rs` | `MessageDiff` / `{source}` |
+| `docs/examples/commit-message.toml` | non-loaded example |
+
+---
+
 ## 2026-08-28 — review fixes (unix list, hide-after-close, install path)
 
 Codex review of the visibility patch (`upstream/main...HEAD`).
