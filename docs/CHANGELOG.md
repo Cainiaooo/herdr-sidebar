@@ -24,10 +24,8 @@ Conflict resolutions:
 - `ensure-sidebar.sh`: still reads workspace-keyed auto-open before the lock,
   then re-reads scope from the pane snapshot after it.
 - `CLAUDE.md`: keep both the scroll-snap gotcha and the Quick Open notes.
-- `.github/workflows/release.yml`: keep `actions/upload-artifact@v4`. Upstream
-  bumped it to v7, but `gh`'s OAuth token (`repo`, `gist`, `read:org`) cannot
-  push workflow-file changes without the `workflow` scope, and that blocked
-  the whole merge. Bump it after `gh auth refresh -s workflow`.
+- `.github/workflows/release.yml`: follow upstream to `actions/upload-artifact@v7`
+  (needs `gh auth refresh -s workflow` so the OAuth token can push workflow files).
 
 ---
 

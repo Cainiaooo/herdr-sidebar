@@ -138,13 +138,10 @@ refusing to allow an OAuth App to create or update workflow
 `.github/workflows/release.yml` without `workflow` scope
 ```
 
-Fix, in order:
-
-1. `gh auth refresh -s workflow` (browser prompt; adds the missing scope), then
-   push again; or
-2. Keep our copy of the workflow file in the merge (what we did for v0.11.0)
-   and bump it later once the token has `workflow`. Do not use GitHub's
-   **Sync fork** button for this — it hits the same restriction.
+Fix: `gh auth refresh -s workflow` (browser device flow), then push. Do not use
+GitHub's **Sync fork** button for this — it hits the same restriction. Once the
+token has `workflow`, follow upstream workflow files (currently
+`actions/upload-artifact@v7`).
 
 If a merge looks wrong, compare against the last known-good upstream base
 recorded in `CHANGELOG.md`.

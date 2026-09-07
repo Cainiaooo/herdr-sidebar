@@ -120,17 +120,16 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
 
 ### Fork push vs GitHub workflow files (verified 2026-09-07)
 
-- `origin` uses HTTPS + `gh auth git-credential`. That OAuth token's scopes are
-  `gist`, `read:org`, `repo` — **no `workflow`**. GitHub then rejects any push
-  that would add/update `.github/workflows/*`:
+- `origin` uses HTTPS + `gh auth git-credential`. Without the `workflow` scope,
+  GitHub rejects any push that would add/update `.github/workflows/*`:
   `refusing to allow an OAuth App to create or update workflow … without workflow scope`.
-  The rest of the merge is fine; one workflow hunk blocks the entire `git push`.
-- `gh auth refresh -s workflow` adds the scope (browser). SSH would also bypass
-  it, but this machine's Clash TUN (`github.com` → `30.100.x`, proxy
+  The rest of a merge is fine; one workflow hunk blocks the entire `git push`.
+- `gh auth refresh -s workflow` adds the scope (browser device flow). SSH would
+  also bypass it, but this machine's Clash TUN (`github.com` → `30.100.x`, proxy
   `127.0.0.1:7897`) closes GitHub SSH on 22 and 443 (`kex_exchange_identification`).
-- Until the token has `workflow`, keep our existing workflow file in the merge
-  (v0.11.0: leave `actions/upload-artifact@v4` instead of upstream's v7). GitHub's
-  **Sync fork** button hits the same OAuth check — merge locally, then push.
+- After the token has `workflow`, follow upstream workflow files (v0.11.0:
+  `actions/upload-artifact@v7`). GitHub's **Sync fork** button hits the same
+  OAuth check — merge locally, then push.
 - This machine's global `core.hooksPath` is `C:/Users/Admin/.bytesec/commit_hook/`.
   Those hooks call `/usr/bin/uname` etc. and fail with Permission denied, so
   `git commit` / `git push` die before they reach GitHub. Bypass with
