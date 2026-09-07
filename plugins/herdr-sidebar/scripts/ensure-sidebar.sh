@@ -64,7 +64,9 @@ panes="$("$herdr_bin" pane list 2>/dev/null || true)"
 # you came from during a workspace switch, which rooted new sidebars in the
 # wrong project. Everything below reasons about this one scope — decision,
 # snooze check, and spawn cwd must agree or we dock into the wrong tab.
-# (`scope` was already read from the event payload before the lock.)
+# Auto-open used the event payload before the lock (workspace-keyed). Re-read
+# with the pane snapshot so pane.focused resolves to its own tab.
+scope="$(printf '%s' "$panes" | "$bin" --event-scope 2>/dev/null || true)"
 
 decision="$(printf '%s' "$panes" | "$bin" --launch-decision "" "$scope" 2>/dev/null || true)"
 replacing="false"

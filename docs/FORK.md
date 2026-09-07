@@ -128,6 +128,24 @@ herdr plugin action invoke herdr-sidebar.redeploy-windows
 Never `git push upstream`. A `git pull` with no remote name follows `origin`
 (the fork).
 
+`gh auth git-credential` is an OAuth app. Its default scopes (`repo`, `gist`,
+`read:org`) **cannot push changes under `.github/workflows/`**. If upstream
+touched a workflow, the whole `git push origin main` is rejected even though
+the rest of the merge is fine:
+
+```
+refusing to allow an OAuth App to create or update workflow
+`.github/workflows/release.yml` without `workflow` scope
+```
+
+Fix, in order:
+
+1. `gh auth refresh -s workflow` (browser prompt; adds the missing scope), then
+   push again; or
+2. Keep our copy of the workflow file in the merge (what we did for v0.11.0)
+   and bump it later once the token has `workflow`. Do not use GitHub's
+   **Sync fork** button for this — it hits the same restriction.
+
 If a merge looks wrong, compare against the last known-good upstream base
 recorded in `CHANGELOG.md`.
 

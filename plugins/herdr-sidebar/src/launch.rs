@@ -10,7 +10,7 @@
 //!   the split target, original-pane share, and whether the configured dock
 //!   side needs a swap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
@@ -364,15 +364,22 @@ pub fn focused_pane(pane_list_json: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return String::new();
     };
-    let Some(focused) = msg.result.panes.iter().find(|p| p.focused) else {
+    msg.result
+        .panes
+        .iter()
+        .find(|pane| pane.focused)
+        .map(pane_spawn_target)
+        .unwrap_or_default()
+}
+
+fn pane_spawn_target(pane: &Pane) -> String {
+    let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
         return String::new();
     };
-    let Some(id) = focused.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
-        return String::new();
-    };
-    let cwd = focused
-        .cwd
+    let cwd = pane
+        .foreground_cwd
         .as_deref()
+        .or(pane.cwd.as_deref())
         .map(strip_verbatim)
         .unwrap_or_default();
     format!("{id}\t{cwd}")
@@ -487,8 +494,41 @@ fn event_field(event_json: &str, key: &str) -> Option<String> {
 }
 
 pub fn event_scope(event_json: &str) -> String {
-    event_field(event_json, "tab_id")
-        .or_else(|| event_field(event_json, "workspace_id"))
+    event_scope_in(event_json, "")
+}
+
+/// [`event_scope`] with a pane snapshot available to resolve `pane.focused`.
+/// That event carries a pane id but no tab id, and treating its workspace id
+/// as a scope lets the globally focused pane from any sibling tab win.
+pub fn event_scope_in(event_json: &str, pane_list_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(strip_bom(event_json)) else {
+        return String::new();
+    };
+    let data = value.get("data").unwrap_or(&value);
+    let pick = |key: &str| -> Option<String> {
+        data.get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                // workspace_created carries a nested WorkspaceInfo.
+                data.get(key.trim_end_matches("_id"))
+                    .and_then(|w| w.get(key))
+                    .and_then(|v| v.as_str())
+            })
+            .map(str::to_string)
+    };
+    let pane_id = pick("pane_id");
+    let tab_from_pane = pane_id.as_deref().and_then(|pane_id| {
+        let msg = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).ok()?;
+        msg.result
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id.as_deref() == Some(pane_id))?
+            .tab_id
+            .clone()
+    });
+    pick("tab_id")
+        .or(tab_from_pane)
+        .or_else(|| pick("workspace_id"))
         .filter(|s| is_flag_safe(s))
         .unwrap_or_default()
 }
@@ -561,12 +601,22 @@ pub fn focused_pane_in(pane_list_json: &str, scope: &str) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return String::new();
     };
+    let panes = &msg.result.panes;
+    let workspace_tab = (!scope.is_empty() && !scope.contains(':'))
+        .then(|| {
+            panes
+                .iter()
+                .filter(|pane| pane.workspace_id.as_deref() == Some(scope))
+                .filter_map(|pane| pane.tab_id.as_deref())
+                .collect::<BTreeSet<_>>()
+        })
+        .filter(|tabs| tabs.len() == 1)
+        .and_then(|tabs| tabs.into_iter().next());
     let in_scope = |p: &&Pane| {
         scope.is_empty()
             || p.tab_id.as_deref() == Some(scope)
-            || p.workspace_id.as_deref() == Some(scope)
+            || workspace_tab.is_some_and(|tab_id| p.tab_id.as_deref() == Some(tab_id))
     };
-    let panes = &msg.result.panes;
     let Some(chosen) = panes
         .iter()
         .find(|p| in_scope(p) && p.focused)
@@ -574,11 +624,7 @@ pub fn focused_pane_in(pane_list_json: &str, scope: &str) -> String {
     else {
         return String::new();
     };
-    let Some(id) = chosen.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
-        return String::new();
-    };
-    let cwd = chosen.cwd.as_deref().map(strip_verbatim).unwrap_or_default();
-    format!("{id}\t{cwd}")
+    pane_spawn_target(chosen)
 }
 
 /// Which event invoked the ensure hook, from `HERDR_PLUGIN_EVENT_JSON`.
@@ -952,12 +998,12 @@ mod tests {
     #[test]
     fn spawn_cwd_comes_from_the_events_own_scope() {
         let json = pane_list(
-            r#"{"pane_id":"w4:pM","tab_id":"w4:tY","workspace_id":"w4","focused":true,"cwd":"/repo/faultline"},
-               {"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/tremor"},
-               {"pane_id":"wH:p9","tab_id":"wH:t2","workspace_id":"wH","cwd":"/repo/tremor/sub"}"#,
+            r#"{"pane_id":"w4:pM","tab_id":"w4:tY","workspace_id":"w4","focused":true,"foreground_cwd":"/repo/faultline"},
+               {"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","foreground_cwd":"/repo/tremor"},
+               {"pane_id":"wH:p9","tab_id":"wH:t2","workspace_id":"wH","foreground_cwd":"/repo/tremor/sub"}"#,
         );
-        // A workspace scope takes that workspace's pane, NOT the focused one.
-        assert_eq!(focused_pane_in(&json, "wH"), "wH:p1\t/repo/tremor");
+        // A multi-tab workspace is ambiguous and must not borrow one tab.
+        assert_eq!(focused_pane_in(&json, "wH"), "");
         // A tab scope is more specific still.
         assert_eq!(focused_pane_in(&json, "wH:t2"), "wH:p9\t/repo/tremor/sub");
         // No scope keeps the old global behavior.
@@ -971,15 +1017,24 @@ mod tests {
     #[test]
     fn a_scope_prefers_its_focused_pane_but_settles_for_any() {
         let json = pane_list(
-            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/a"},
-               {"pane_id":"wH:p2","tab_id":"wH:t1","workspace_id":"wH","focused":true,"cwd":"/repo/b"}"#,
+            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","foreground_cwd":"/repo/a"},
+               {"pane_id":"wH:p2","tab_id":"wH:t1","workspace_id":"wH","focused":true,"foreground_cwd":"/repo/b"}"#,
         );
         assert_eq!(focused_pane_in(&json, "wH"), "wH:p2\t/repo/b");
 
         let unfocused = pane_list(
-            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","cwd":"/repo/a"}"#,
+            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","foreground_cwd":"/repo/a"}"#,
         );
         assert_eq!(focused_pane_in(&unfocused, "wH"), "wH:p1\t/repo/a");
+    }
+
+    #[test]
+    fn spawn_scope_falls_back_to_cwd_when_live_cwd_is_unavailable() {
+        let json = pane_list(
+            r#"{"pane_id":"wH:p1","tab_id":"wH:t1","workspace_id":"wH","focused":true,
+                "cwd":"C:\\repo\\tremor"}"#,
+        );
+        assert_eq!(focused_pane_in(&json, "wH:t1"), "wH:p1\tC:\\repo\\tremor");
     }
 
     #[test]
@@ -1012,6 +1067,17 @@ mod tests {
         assert_eq!(focused_workspace(&panes), "w1");
         // A workspace-only scope with no pane id must not borrow another tab.
         assert_eq!(snooze_tab("", &panes, "w2"), "");
+    }
+
+    #[test]
+    fn pane_focus_scope_resolves_to_its_own_tab() {
+        let event = r#"{"data":{"type":"pane_focused","pane_id":"w4:p9","workspace_id":"w4"}}"#;
+        let panes = pane_list(
+            r#"{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4"},
+               {"pane_id":"w4:p9","tab_id":"w4:t2","workspace_id":"w4"}"#,
+        );
+        assert_eq!(event_scope_in(event, &panes), "w4:t2");
+        assert_eq!(event_scope(event), "w4");
     }
 
     /// The hook fires for five different events into ONE script, so the only

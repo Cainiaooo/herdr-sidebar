@@ -49,6 +49,12 @@ pub const EXECUTABLE_NAME: &str = "herdr-sidebar";
 /// has different quoting/call syntax.
 pub const PREVIEW_CONTROL_ENV: &str = "HERDR_SIDEBAR_PREVIEW_CONTROL";
 
+/// Set on viewer panes spawned into the sidebar's own tab
+/// ([`PreviewPlacement::Pane`]). A viewer's placement is fixed by where its
+/// pane physically sits, so it travels with the process rather than being
+/// re-read from the settings file, which the user can flip mid-life.
+pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
+
 /// Unix seconds now — the heartbeat clock for pane identity tokens.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -136,10 +142,13 @@ impl View {
 }
 
 /// Accent palette for the sidebar. `VsCode` preserves the historical RGB
-/// styling; `Terminal` uses ANSI colors so the terminal profile remaps them.
+/// styling, which assumes a DARK terminal background; `Light` is its
+/// light-background counterpart; `Terminal` uses ANSI colors so the terminal
+/// profile remaps them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ColorTheme {
     VsCode,
+    Light,
     Terminal,
 }
 
@@ -147,21 +156,71 @@ impl ColorTheme {
     pub fn label(self) -> &'static str {
         match self {
             Self::VsCode => "vscode",
+            Self::Light => "light",
             Self::Terminal => "terminal",
         }
     }
 
-    pub fn other(self) -> Self {
+    /// The Settings row cycles through every theme — a rotation, not a
+    /// two-way toggle.
+    pub fn next(self) -> Self {
         match self {
-            Self::VsCode => Self::Terminal,
+            Self::VsCode => Self::Light,
+            Self::Light => Self::Terminal,
             Self::Terminal => Self::VsCode,
         }
+    }
+
+    /// This palette is drawn for a LIGHT terminal background: the preview's
+    /// syntax theme, diff tints and icon colors follow it.
+    pub fn is_light(self) -> bool {
+        self == Self::Light
     }
 
     fn from_state_name(name: &str) -> Option<Self> {
         match name {
             "vscode" => Some(Self::VsCode),
+            "light" => Some(Self::Light),
             "terminal" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+}
+
+/// Where a preview, diff or `git show` opens. `Tab` gives every document its
+/// own herdr tab (VS Code editor-tab semantics, the historical default);
+/// `Pane` splits ONE viewer pane into the tab the sidebar already lives in
+/// and reuses it for every later click.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreviewPlacement {
+    Tab,
+    Pane,
+}
+
+impl PreviewPlacement {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tab => "tab",
+            Self::Pane => "pane",
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Tab => Self::Pane,
+            Self::Pane => Self::Tab,
+        }
+    }
+
+    /// True when previews share the caller's tab instead of getting one.
+    pub fn is_inline(self) -> bool {
+        matches!(self, Self::Pane)
+    }
+
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name {
+            "tab" => Some(Self::Tab),
+            "pane" => Some(Self::Pane),
             _ => None,
         }
     }
@@ -211,6 +270,9 @@ pub struct State {
     /// column target in the normal range and yields proportionally when the
     /// tab becomes unusually narrow.
     pub sidebar_width: u16,
+    /// Whether a clicked file opens in its own tab or in a viewer pane beside
+    /// the sidebar, inside the tab the click came from.
+    pub preview_placement: PreviewPlacement,
 }
 
 impl Default for State {
@@ -229,6 +291,7 @@ impl Default for State {
             git_deco: true,
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            preview_placement: PreviewPlacement::Tab,
         }
     }
 }
@@ -400,7 +463,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\"{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\"{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
@@ -412,7 +475,8 @@ fn write_state(path: &Path, state: State) {
         state.git_deco,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
-        state.color_theme.label()
+        state.color_theme.label(),
+        state.preview_placement.label()
     );
     let _ = std::fs::write(path, json);
 }
@@ -735,25 +799,25 @@ fn decode_roots_file(json: &str) -> RootsFile {
         .unwrap_or_default()
 }
 
-/// The root remembered for `label`, if any. An empty label never matches —
-/// it would collide across every space that failed to report one.
-fn root_for_label(file: &RootsFile, label: &str) -> Option<PathBuf> {
-    if label.is_empty() {
+/// The root remembered for `key`, if any. An empty key never matches — it
+/// would collide across every pane that failed to report its project identity.
+fn root_for_key(file: &RootsFile, key: &str) -> Option<PathBuf> {
+    if key.is_empty() {
         return None;
     }
-    file.get(label).and_then(|v| v.as_str()).map(PathBuf::from)
+    file.get(key).and_then(|v| v.as_str()).map(PathBuf::from)
 }
 
-/// The root this space's tree should use, or `None` to fall back to the
+/// The root this project's tree should use, or `None` to fall back to the
 /// pane's cwd.
-pub fn load_root(label: &str) -> Option<PathBuf> {
+pub fn load_root(key: &str) -> Option<PathBuf> {
     let json = roots_path().and_then(|p| std::fs::read_to_string(p).ok())?;
-    root_for_label(&decode_roots_file(&json), label)
+    root_for_key(&decode_roots_file(&json), key)
 }
 
-/// Remember `root` for `label`, leaving other spaces' choices alone.
-pub fn save_root(label: &str, root: &Path) {
-    if label.is_empty() {
+/// Remember `root` for `key`, leaving other projects' choices alone.
+pub fn save_root(key: &str, root: &Path) {
+    if key.is_empty() {
         return;
     }
     let Some(path) = roots_path() else { return };
@@ -767,7 +831,7 @@ pub fn save_root(label: &str, root: &Path) {
         .map(|json| decode_roots_file(&json))
         .unwrap_or_default();
     file.insert(
-        label.to_string(),
+        key.to_string(),
         serde_json::json!(root.display().to_string()),
     );
     if let Ok(json) = serde_json::to_string(&file) {
@@ -927,6 +991,11 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| u16::try_from(v).ok())
             .map(clamp_sidebar_width)
             .unwrap_or(default.sidebar_width),
+        preview_placement: value
+            .get("preview_placement")
+            .and_then(|v| v.as_str())
+            .and_then(PreviewPlacement::from_state_name)
+            .unwrap_or(default.preview_placement),
     }
 }
 
@@ -934,32 +1003,33 @@ pub fn parse_state(json: &str) -> State {
 mod tests {
     use super::*;
 
-    /// Workspace IDs are per-space-INSTANCE, not per-project: closing and
-    /// recreating `tremor` moved it from `wG` to `wH` inside one session.
-    /// Keying a remembered root on the id would hand a future space the root
-    /// picked for an unrelated one, so the label is the key.
+    /// A workspace can hold several unrelated project tabs. The caller
+    /// combines its workspace label and normalized spawn cwd so a volatile tab
+    /// id cannot leak state or grow the file on every server restart.
     #[test]
-    fn remembered_roots_are_keyed_by_workspace_label() {
-        let file = decode_roots_file(r#"{"tremor":"/repo/tremor","faultline":"/repo/faultline"}"#);
-        assert_eq!(
-            root_for_label(&file, "tremor"),
-            Some(PathBuf::from("/repo/tremor"))
+    fn remembered_roots_are_keyed_by_workspace_and_project() {
+        let file = decode_roots_file(
+            r#"{"acme::/repo/web":"/repo/web","acme::/repo/admin":"/repo/admin"}"#,
         );
         assert_eq!(
-            root_for_label(&file, "faultline"),
-            Some(PathBuf::from("/repo/faultline"))
+            root_for_key(&file, "acme::/repo/web"),
+            Some(PathBuf::from("/repo/web"))
+        );
+        assert_eq!(
+            root_for_key(&file, "acme::/repo/admin"),
+            Some(PathBuf::from("/repo/admin"))
         );
         // An unknown space has made no choice yet — the caller falls back to cwd.
-        assert_eq!(root_for_label(&file, "bedrock"), None);
+        assert_eq!(root_for_key(&file, "acme::/repo/jobs"), None);
         // An empty label must never match; it would collide across spaces.
-        assert_eq!(root_for_label(&file, ""), None);
+        assert_eq!(root_for_key(&file, ""), None);
     }
 
     #[test]
     fn a_garbled_roots_file_forgets_rather_than_wedges() {
         for junk in ["garbage", "[]", r#"{"tremor":42}"#, ""] {
             assert_eq!(
-                root_for_label(&decode_roots_file(junk), "tremor"),
+                root_for_key(&decode_roots_file(junk), "acme::/repo/web"),
                 None,
                 "{junk}"
             );
@@ -1066,8 +1136,9 @@ mod tests {
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
+            preview_placement: PreviewPlacement::Pane,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1081,6 +1152,24 @@ mod tests {
             parse_state("{\"merged\":true}").color_theme,
             ColorTheme::VsCode
         );
+        // The Settings row cycles all three themes and comes back around, and
+        // every label round-trips through the state file.
+        let mut theme = ColorTheme::VsCode;
+        for expected in [ColorTheme::Light, ColorTheme::Terminal, ColorTheme::VsCode] {
+            theme = theme.next();
+            assert_eq!(theme, expected);
+            assert_eq!(ColorTheme::from_state_name(theme.label()), Some(theme));
+        }
+        assert_eq!(
+            parse_state("{\"colors\":\"light\"}").color_theme,
+            ColorTheme::Light
+        );
+        // An unknown name is not a light theme — it falls back to the default.
+        assert!(
+            !parse_state("{\"colors\":\"solarized\"}")
+                .color_theme
+                .is_light()
+        );
         // Existing installs get neighbour following by default.
         assert!(parse_state("{\"merged\":true}").follow_cwd);
         assert!(parse_state("{\"merged\":true}").git_deco);
@@ -1089,6 +1178,21 @@ mod tests {
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
         assert_eq!(parse_state("{\"sidebar_width\":1}").sidebar_width, 24);
         assert_eq!(parse_state("{\"sidebar_width\":999}").sidebar_width, 80);
+        // Files written before the preview setting existed keep the
+        // historical behavior: a tab per document.
+        assert_eq!(
+            parse_state("{\"merged\":true}").preview_placement,
+            PreviewPlacement::Tab
+        );
+        // Undocumented placement names fall back to the stable tab default.
+        assert_eq!(
+            parse_state("{\"preview_placement\":\"split\"}").preview_placement,
+            PreviewPlacement::Tab
+        );
+        assert_eq!(
+            parse_state("{\"preview_placement\":\"nonsense\"}").preview_placement,
+            PreviewPlacement::Tab
+        );
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
     }

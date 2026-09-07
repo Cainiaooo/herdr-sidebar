@@ -18,7 +18,9 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
+#[cfg(test)]
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
@@ -27,6 +29,7 @@ use crate::ansi;
 use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
 use crate::ipc;
+use crate::ui::{icon_style as ui_icon_style, palette};
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
 /// and reuse it (distinct from the sidebar's own identity tokens).
@@ -479,7 +482,7 @@ fn selected_row(
                 after_start && before_end
             });
             let style = if selected {
-                span.style.bg(Color::DarkGray)
+                span.style.bg(palette().text_selection_bg)
             } else {
                 span.style
             };
@@ -612,10 +615,7 @@ fn apply_pending(
     control: &Path,
 ) -> bool {
     match pending {
-        Pending::Close => {
-            close_own_pane(control);
-            true
-        }
+        Pending::Close => close_own_pane(control),
         Pending::LeaveEdit => {
             if let Some(request) = current.as_ref() {
                 *mode = ViewMode::Preview(load(request));
@@ -625,8 +625,7 @@ fn apply_pending(
         }
         Pending::Switch(request) => {
             if request == Request::Close {
-                close_own_pane(control);
-                true
+                close_own_pane(control)
             } else {
                 *mode = ViewMode::Preview(load(&request));
                 *current = Some(request);
@@ -881,19 +880,27 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
     if pane_id.is_empty() {
         return;
     }
+    let inline = runs_inline();
     let doc_token = doc_key.map(document_token);
     let control_token = control_token(control);
+    let mut tokens = serde_json::json!({
+        METADATA_SOURCE: crate::state::unix_now().to_string(),
+        TOKEN_PATH: doc_token,
+        TOKEN_CONTROL: control_token,
+    });
+    if inline {
+        // We share the tab with the sidebar and whatever the user put there.
+        // Claiming ownership of it would let a close take the whole tab down.
+        tokens[TOKEN_INLINE] = serde_json::Value::String("1".into());
+    } else {
+        tokens[TOKEN_DEDICATED] = serde_json::Value::String("1".into());
+    }
     let _ = ipc::call_text(
         "pane.report_metadata",
         serde_json::json!({
             "pane_id": pane_id,
             "source": METADATA_SOURCE,
-            "tokens": {
-                METADATA_SOURCE: crate::state::unix_now().to_string(),
-                TOKEN_PATH: doc_token,
-                TOKEN_CONTROL: control_token,
-                TOKEN_DEDICATED: "1",
-            },
+            "tokens": tokens,
         }),
     );
     let _ = ipc::call_text(
@@ -901,6 +908,10 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
         serde_json::json!({ "pane_id": pane_id, "label": mode_pane_label(mode) }),
     );
     let Some(doc_key) = doc_key else { return };
+    // The tab is the user's, not the document's, when we share it.
+    if inline {
+        return;
+    }
     if let Ok(list) = ipc::call_text("pane.list", serde_json::json!({}))
         && let Some(preview) = previews_in(&list)
             .into_iter()
@@ -916,6 +927,13 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
     }
 }
 
+/// This viewer shares the sidebar's tab. Read from the spawn env rather than
+/// the settings file: the setting decides where the NEXT preview opens, while
+/// a running viewer's placement is whatever its pane already is.
+fn runs_inline() -> bool {
+    std::env::var(crate::state::PREVIEW_INLINE_ENV).is_ok_and(|value| value == "1")
+}
+
 fn preview_pane_label(doc_name: &str) -> String {
     format!("{doc_name} · preview")
 }
@@ -926,12 +944,24 @@ fn editor_pane_label(doc_name: &str) -> String {
 
 /// Close the whole preview tab. Closing only the viewer pane leaves its
 /// auto-docked sidebar behind as a convincing but unusable preview husk.
-fn close_own_pane(control: &Path) {
+/// An inline viewer owns nothing but its own pane, so it closes just that.
+fn close_own_pane(control: &Path) -> bool {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
-        return;
+        return false;
     };
     if pane_id.is_empty() {
-        return;
+        return false;
+    }
+    if runs_inline() {
+        let closed = pane_close_succeeded(ipc::call_text(
+            "pane.close",
+            serde_json::json!({ "pane_id": pane_id }),
+        ));
+        if closed {
+            let _ = std::fs::remove_file(control);
+            let _ = std::fs::remove_file(control_path_for_pane(&pane_id));
+        }
+        return closed;
     }
     let list = ipc::call_text("pane.list", serde_json::json!({})).ok();
     let preview = list.as_deref().and_then(|json| {
@@ -951,6 +981,7 @@ fn close_own_pane(control: &Path) {
     } else {
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
+    true
 }
 
 fn close_preview_tab(preview: &PreviewPane) {
@@ -968,7 +999,14 @@ fn close_preview_tab(preview: &PreviewPane) {
     );
 }
 
+/// The first edit that dirties the buffer pins this document's tab, so the
+/// next file click cannot silently take the tab away from it. Inline has no
+/// second tab to send that click to — the switch prompt guards the buffer
+/// there instead — so pinning is skipped rather than faked.
 fn pin_own_tab(doc_key: &str) {
+    if runs_inline() {
+        return;
+    }
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
@@ -1217,8 +1255,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         });
                                     }
                                     KeyCode::Esc | KeyCode::Char('q') => {
-                                        close_own_pane(control);
-                                        should_close = true;
+                                        should_close = close_own_pane(control);
                                     }
                                     KeyCode::Char('e') => {
                                         if let Some(Request::File(path)) = current.as_ref() {
@@ -1287,8 +1324,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         if editor.dirty {
                                             prompt = Some(Prompt::Unsaved(Pending::Close));
                                         } else {
-                                            close_own_pane(control);
-                                            should_close = true;
+                                            should_close = close_own_pane(control);
                                         }
                                     }
                                     EditAction::Save => match editor.save(false) {
@@ -1312,8 +1348,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             MouseEventKind::Down(MouseButton::Left)
                                 if mouse.row == 0 && mouse.column < 3 =>
                             {
-                                close_own_pane(control);
-                                should_close = true;
+                                should_close = close_own_pane(control);
                             }
                             _ => doc.on_mouse(&mouse, preview_body),
                         }
@@ -1331,8 +1366,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             if editor.dirty {
                                 prompt = Some(Prompt::Unsaved(Pending::Close));
                             } else {
-                                close_own_pane(control);
-                                should_close = true;
+                                should_close = close_own_pane(control);
                             }
                         }
                         _ if prompt.is_none() => editor.on_mouse(&mouse, edit_body),
@@ -1354,6 +1388,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 current.as_ref().map(Request::doc_key).as_deref(),
                 control,
             );
+            // Settings live in a shared file another pane may rewrite; the
+            // heartbeat is the sidebar's own re-read cadence. Chrome, diff
+            // tints and selection follow immediately — an already-highlighted
+            // file keeps its syntax colors until it is reloaded.
+            crate::ui::set_color_theme(crate::state::load_state().color_theme);
             last_heartbeat = Instant::now();
         }
         if prompt.is_none() {
@@ -1366,8 +1405,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 {
                     prompt = Some(Prompt::Unsaved(Pending::Switch(request)));
                 } else if request == Request::Close {
-                    close_own_pane(control);
-                    break Ok(());
+                    if close_own_pane(control) {
+                        break Ok(());
+                    }
                 } else {
                     mode = ViewMode::Preview(load(&request));
                     current = Some(request);
@@ -1451,12 +1491,9 @@ fn draw_doc(
     );
 
     let file_icon = icon(theme, &doc.name, false, false);
-    let icon_style = match file_icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(file_icon.rgb);
     let left = vec![
-        Span::styled(" ✕ ", Style::default().bold().fg(Color::LightBlue)),
+        Span::styled(" ✕ ", Style::default().bold().fg(palette().header_accent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(doc.name.clone(), Style::default().bold()),
     ];
@@ -1527,10 +1564,7 @@ fn draw_editor(
     .areas(area);
     let name = editor.name();
     let file_icon = icon(theme, &name, false, false);
-    let icon_style = match file_icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(file_icon.rgb);
     let dirty = if editor.dirty { " ●" } else { "" };
     let external = if editor.external_changed {
         "  EXTERNAL CHANGE"
@@ -1538,11 +1572,11 @@ fn draw_editor(
         ""
     };
     let left = vec![
-        Span::styled(" ✕ ", Style::default().bold().fg(Color::LightBlue)),
+        Span::styled(" ✕ ", Style::default().bold().fg(palette().header_accent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(format!("{name}{dirty}"), Style::default().bold()),
-        Span::styled("  EDIT (experimental)", Style::default().fg(Color::Yellow)),
-        Span::styled(external, Style::default().fg(Color::LightRed).bold()),
+        Span::styled("  EDIT (experimental)", Style::default().fg(palette().warning)),
+        Span::styled(external, Style::default().fg(palette().conflict).bold()),
     ];
     let used: usize = left.iter().map(Span::width).sum();
     let context = editor.context();
@@ -1577,15 +1611,26 @@ fn draw_editor(
 // Client side: how the sidebar views open things in the viewer pane.
 // ---------------------------------------------------------------------------
 
-/// Open `payload` (identified by `doc_key`) following VS Code tab rules:
-/// jump to the document's existing tab, else overwrite the one ephemeral
-/// tab, else create a tab for it.
+/// Open `payload` (identified by `doc_key`) where the `Preview placement`
+/// setting says.
+///
+/// In `Tab` placement this follows VS Code tab rules: jump to the document's
+/// existing tab, else overwrite the one ephemeral tab, else create a tab.
+///
+/// In `Pane` placement there is exactly ONE viewer pane per tab, split in
+/// beside the sidebar and reused for every later click. Pinning is meaningless
+/// without a tab of its own, so an inline viewer is always reusable — a dirty
+/// editor is protected by the viewer's own unsaved-changes prompt on the
+/// control-file switch, not by refusing to route to it (refusing would split
+/// the tab again on every click).
 pub fn open_in_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
     doc_key: &str,
     payload: &str,
 ) -> Result<PreviewTarget, String> {
+    let state = crate::state::load_state();
+    let inline = state.preview_placement.is_inline();
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
     let caller_tab_id = crate::launch::tab_of(&list, my_pane_id);
@@ -1611,33 +1656,56 @@ pub fn open_in_pane(
     }
     previews.retain(|preview| !preview.stale);
     previews.sort_by(|a, b| a.tab_id.cmp(&b.tab_id).then(a.pane_id.cmp(&b.pane_id)));
+    // An inline viewer belongs to ONE tab: never route this tab's clicks into
+    // another tab's pane, and never let a tab-mode click adopt one.
+    previews.retain(|preview| {
+        preview.inline == inline && (!inline || preview.tab_id == caller_tab_id)
+    });
     let origin_tab_id = preview_origin_tab(&previews, &caller_tab_id);
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
         remember_origin(&p.pane_id, &origin_tab_id);
-        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        if !inline {
+            let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        }
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
             tab_id: p.tab_id,
             origin_tab_id,
+            inline,
         });
     }
 
-    // 2. Overwrite the ephemeral tab.
-    if let Some(p) = reusable_preview(&previews) {
+    // 2. Overwrite the ephemeral tab (inline: the tab's one viewer pane).
+    if let Some(p) = reusable_preview(&previews, inline) {
         write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
-        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        if !inline {
+            let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+        }
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
             tab_id: p.tab_id,
             origin_tab_id,
+            inline,
         });
     }
 
-    // 3. Nothing reusable — a tab of its own.
-    spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
+    // 3. Nothing reusable — a pane beside the sidebar, or a tab of its own.
+    if inline {
+        spawn_inline_pane(
+            my_pane_id,
+            spawn_cwd,
+            doc_key,
+            payload,
+            &caller_tab_id,
+            state.dock_right,
+            state.sidebar_width,
+        )
+    } else {
+        spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
+    }
 }
 
 /// Where a preview request landed. Handed back so a double click can pin
@@ -1648,13 +1716,23 @@ pub struct PreviewTarget {
     pub pane_id: String,
     pub tab_id: String,
     pub origin_tab_id: String,
+    /// The viewer shares the caller's tab, so it has no tab of its own to pin
+    /// or rename.
+    pub inline: bool,
 }
 
 /// Mark a preview's tab pinned: wait briefly for a clean viewer to acknowledge
 /// the first click, then stamp the token so it stops being reusable. Dirty
 /// editors deliberately do not acknowledge a switch until the user resolves
 /// their unsaved-change prompt. Idempotent.
+///
+/// Inline placement has no second tab for the next file to land in, so there
+/// is nothing to pin — report success so a double click stays a plain
+/// "show me this" instead of raising a bogus confirmation warning.
 pub fn pin_target(target: &PreviewTarget, doc_key: &str) -> bool {
+    if target.inline {
+        return true;
+    }
     let deadline = Instant::now() + Duration::from_millis(800);
     loop {
         let Ok(list) = ipc::call_text("pane.list", serde_json::json!({})) else {
@@ -1701,7 +1779,7 @@ fn spawn_preview_tab(
     payload: &str,
     origin_tab_id: &str,
 ) -> Result<PreviewTarget, String> {
-    let (new_pane, control) = spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload)?;
+    let (new_pane, control) = spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload, None)?;
     let moved = match ipc::call_text(
         "pane.move",
         serde_json::json!({
@@ -1740,6 +1818,47 @@ fn spawn_preview_tab(
         pane_id: new_pane,
         tab_id,
         origin_tab_id: origin_tab_id.to_string(),
+        inline: false,
+    })
+}
+
+/// Spawn the tab's one inline viewer pane, beside the sidebar on the side
+/// away from its dock edge, and leave focus in the sidebar: the preview is
+/// visible right there, so stealing focus would only stop the user from
+/// walking the tree with the arrow keys.
+fn spawn_inline_pane(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+    caller_tab_id: &str,
+    dock_right: bool,
+    sidebar_cols: u16,
+) -> Result<PreviewTarget, String> {
+    let (new_pane, control) = spawn_viewer_pane(
+        my_pane_id,
+        spawn_cwd,
+        doc_key,
+        payload,
+        Some(InlineSpawn {
+            dock_right,
+            sidebar_cols,
+        }),
+    )?;
+    // A swap moves the FOCUSED SLOT's occupant, not the focus: when the plan
+    // swapped us out of our own slot, focus is now sitting on the brand-new
+    // pane. Put it back before the shell there starts consuming keystrokes.
+    let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": my_pane_id }));
+    remember_origin(&new_pane, caller_tab_id);
+    if !start_viewer_pane(&new_pane) {
+        cleanup_spawn(&new_pane, &control);
+        return Err("preview process failed to start".into());
+    }
+    Ok(PreviewTarget {
+        pane_id: new_pane,
+        tab_id: caller_tab_id.to_string(),
+        origin_tab_id: caller_tab_id.to_string(),
+        inline: true,
     })
 }
 
@@ -1844,6 +1963,10 @@ pub const TOKEN_PINNED: &str = "hs-preview-pinned";
 pub const TOKEN_CONTROL: &str = "hs-preview-control";
 pub const TOKEN_DEDICATED: &str = "hs-preview-dedicated";
 pub const TOKEN_ORIGIN_TAB: &str = "hs-preview-origin-tab";
+/// This viewer shares the sidebar's tab instead of owning one
+/// (`PreviewPlacement::Pane`). Routing needs it on the PANE so flipping the
+/// setting cannot hand a tab-mode click an inline pane, or the reverse.
+pub const TOKEN_INLINE: &str = "hs-preview-inline";
 
 /// A live preview pane and the document it is showing. State lives on the
 /// pane, so it cannot outlive what it describes.
@@ -1860,6 +1983,8 @@ pub struct PreviewPane {
     pub control: PathBuf,
     pub stale: bool,
     pub dedicated: bool,
+    /// Shares the sidebar's tab (see [`TOKEN_INLINE`]).
+    pub inline: bool,
     pub origin_tab_id: String,
     /// Herdr restored the pane label but not its process metadata. This is a
     /// dead shell left behind by server resume, not a live unsaved editor.
@@ -1938,6 +2063,7 @@ fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
                 control,
                 stale,
                 dedicated: p.tokens.contains_key(TOKEN_DEDICATED),
+                inline: p.tokens.contains_key(TOKEN_INLINE),
                 origin_tab_id: p
                     .tokens
                     .get(TOKEN_ORIGIN_TAB)
@@ -2009,9 +2135,14 @@ fn preview_for_doc(previews: &[PreviewPane], doc_key: &str) -> Option<PreviewPan
         .cloned()
 }
 
-/// The ephemeral tab, if one exists. Pinned tabs are never overwritten.
-fn reusable_preview(previews: &[PreviewPane]) -> Option<PreviewPane> {
-    previews.iter().find(|p| !p.stale && !p.pinned).cloned()
+/// The ephemeral tab, if one exists. Pinned tabs are never overwritten —
+/// except inline, where the pane IS the tab's single viewer and pinning never
+/// happens (see [`open_in_pane`]).
+fn reusable_preview(previews: &[PreviewPane], inline: bool) -> Option<PreviewPane> {
+    previews
+        .iter()
+        .find(|p| !p.stale && (inline || !p.pinned))
+        .cloned()
 }
 
 /// An ephemeral preview's sidebar is itself a valid launch surface. Preserve
@@ -2033,36 +2164,76 @@ fn preview_origin_tab(previews: &[PreviewPane], caller_tab_id: &str) -> String {
 /// Split a viewer pane directly to the caller's right: split the right
 /// NEIGHBOR and swap the fresh pane into its left slot (split only goes
 /// right/down), so the layout reads sidebar | preview | rest.
+/// Geometry inputs for an inline spawn: which edge the sidebar is docked at
+/// and how wide it wants to stay.
+#[derive(Clone, Copy)]
+struct InlineSpawn {
+    dock_right: bool,
+    sidebar_cols: u16,
+}
+
+/// One `pane.split` invocation: what to split, the ORIGINAL pane's share, and
+/// whether the fresh pane has to be swapped into the split target's slot.
+#[derive(Clone, Debug, PartialEq)]
+struct SplitPlan {
+    target: String,
+    ratio: f64,
+    swap: bool,
+}
+
+/// A legal self-split when `pane.layout` cannot describe the real geometry.
+/// Keep the historical 30% sidebar share and mirror the split for a right
+/// dock: after swapping occupants, the sidebar lands in the 30% right slot.
+fn fallback_inline_split_plan(pane_id: &str, inline: InlineSpawn) -> SplitPlan {
+    SplitPlan {
+        target: pane_id.to_string(),
+        ratio: if inline.dock_right { 0.7 } else { 0.3 },
+        swap: inline.dock_right,
+    }
+}
+
 fn spawn_viewer_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
     doc_key: &str,
     payload: &str,
+    inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
     let control = fresh_control_path();
     let doc_token = document_token(doc_key);
     let control_token = control_token(&control);
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
-    let neighbor = layout
-        .as_deref()
-        .and_then(|json| right_neighbor(json, my_pane_id));
-    // Splitting ourselves (no neighbor): a third of the tab, matching the
-    // sidebar's usual share.
-    let own_frac = 0.3;
-    let (target, ratio, needs_swap) = match &neighbor {
-        Some(id) => (id.clone(), 0.5, true),
-        None => (my_pane_id.to_string(), own_frac, false),
+    let plan = match inline {
+        Some(inline) => layout
+            .as_deref()
+            .and_then(|json| inline_split_plan(json, my_pane_id, inline))
+            .unwrap_or_else(|| fallback_inline_split_plan(my_pane_id, inline)),
+        // Tab placement: the pane is moved out immediately, so this geometry
+        // only has to be legal, never pretty.
+        None => {
+            let neighbor = layout
+                .as_deref()
+                .and_then(|json| side_neighbor(json, my_pane_id, false));
+            match neighbor {
+                Some(target) => SplitPlan { target, ratio: 0.5, swap: true },
+                None => SplitPlan {
+                    target: my_pane_id.to_string(),
+                    ratio: 0.3,
+                    swap: false,
+                },
+            }
+        }
     };
     let response = ipc::call_text(
         "pane.split",
         serde_json::json!({
-            "target_pane_id": target,
+            "target_pane_id": plan.target,
             "direction": "right",
-            "ratio": ratio,
+            "ratio": plan.ratio,
             "focus": false,
             "cwd": spawn_cwd.display().to_string(),
-            "env": preview_spawn_env(&control),
+            "env": preview_spawn_env(&control, inline.is_some()),
         }),
     );
     let new_pane = response
@@ -2072,26 +2243,30 @@ fn spawn_viewer_pane(
             let _ = std::fs::remove_file(&control);
             "preview pane failed to open".to_string()
         })?;
-    if needs_swap
+    if plan.swap
         && !ipc::call_text(
             "pane.swap",
-            serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": target }),
+            serde_json::json!({ "source_pane_id": new_pane, "target_pane_id": plan.target }),
         )
         .is_ok_and(|response| ipc_succeeded(&response))
     {
         cleanup_spawn(&new_pane, &control);
         return Err("preview pane could not be positioned".into());
     }
+    let mut tokens = serde_json::json!({
+        METADATA_SOURCE: crate::state::unix_now().to_string(),
+        TOKEN_PATH: doc_token,
+        TOKEN_CONTROL: control_token,
+    });
+    if inline.is_some() {
+        tokens[TOKEN_INLINE] = serde_json::Value::String("1".into());
+    }
     if !ipc::call_text(
         "pane.report_metadata",
         serde_json::json!({
             "pane_id": new_pane,
             "source": METADATA_SOURCE,
-            "tokens": {
-                METADATA_SOURCE: crate::state::unix_now().to_string(),
-                TOKEN_PATH: doc_token,
-                TOKEN_CONTROL: control_token,
-            },
+            "tokens": tokens,
         }),
     )
     .is_ok_and(|response| ipc_succeeded(&response))
@@ -2163,54 +2338,120 @@ fn ipc_succeeded(response: &str) -> bool {
         .is_some_and(|value| value.get("result").is_some() && value.get("error").is_none())
 }
 
-fn preview_spawn_env(control: &Path) -> serde_json::Value {
+fn pane_close_succeeded(response: std::io::Result<String>) -> bool {
+    response.is_ok_and(|response| ipc_succeeded(&response))
+}
+
+fn preview_spawn_env(control: &Path, inline: bool) -> serde_json::Value {
     let mut env = crate::state::spawn_env();
     env[crate::state::PREVIEW_CONTROL_ENV] =
         serde_json::Value::String(control.display().to_string());
+    if inline {
+        env[crate::state::PREVIEW_INLINE_ENV] = serde_json::Value::String("1".into());
+    }
     env
 }
 
-/// The pane directly to the right of `pane_id` (sharing vertical overlap),
-/// from a `pane.layout` response.
-fn right_neighbor(layout_json: &str, pane_id: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct Msg {
-        result: Res,
+/// Where an inline viewer pane goes: on the side of the sidebar AWAY from its
+/// dock edge, so the sidebar stays on its edge and the layout reads
+/// `sidebar | preview | rest` (or the mirror image when docked right).
+///
+/// Splitting only goes right, so the two cases differ:
+/// - a neighbour on that side is split in half and the fresh pane takes the
+///   slot nearest us (a right dock needs no swap: splitting the LEFT
+///   neighbour already lands the new pane between it and the sidebar);
+/// - with no neighbour we split ourselves and give away everything past the
+///   sidebar's column target, swapping only when the sidebar must end up on
+///   the right.
+///
+/// `None` when the layout can't be read — the caller falls back to a plain
+/// self-split.
+fn inline_split_plan(layout_json: &str, pane_id: &str, inline: InlineSpawn) -> Option<SplitPlan> {
+    if let Some(target) = side_neighbor(layout_json, pane_id, inline.dock_right) {
+        return Some(SplitPlan {
+            target,
+            ratio: 0.5,
+            swap: !inline.dock_right,
+        });
     }
-    #[derive(serde::Deserialize)]
-    struct Res {
-        layout: L,
-    }
-    #[derive(serde::Deserialize)]
-    struct L {
-        #[serde(default)]
-        panes: Vec<P>,
-    }
-    #[derive(serde::Deserialize)]
-    struct P {
-        pane_id: Option<String>,
-        rect: Option<R>,
-    }
-    #[derive(serde::Deserialize)]
-    struct R {
-        x: i64,
-        y: i64,
-        width: i64,
-        height: i64,
-    }
-    let msg: Msg = serde_json::from_str(layout_json.trim_start_matches('\u{feff}')).ok()?;
-    let panes = &msg.result.layout.panes;
+    let my_width = pane_width(layout_json, pane_id)?;
+    let share = (f64::from(inline.sidebar_cols) / my_width).clamp(0.15, 0.5);
+    Some(SplitPlan {
+        target: pane_id.to_string(),
+        // `ratio` is the ORIGINAL pane's share, and a swap moves us into the
+        // other slot — so keeping the sidebar's share means asking for its
+        // complement when we are about to swap.
+        ratio: if inline.dock_right { 1.0 - share } else { share },
+        swap: inline.dock_right,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct LayoutMsg {
+    result: LayoutRes,
+}
+#[derive(serde::Deserialize)]
+struct LayoutRes {
+    layout: LayoutTree,
+}
+#[derive(serde::Deserialize)]
+struct LayoutTree {
+    #[serde(default)]
+    panes: Vec<LayoutPane>,
+}
+#[derive(serde::Deserialize)]
+struct LayoutPane {
+    pane_id: Option<String>,
+    rect: Option<LayoutRect>,
+}
+#[derive(serde::Deserialize)]
+struct LayoutRect {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+fn layout_panes(layout_json: &str) -> Option<Vec<LayoutPane>> {
+    serde_json::from_str::<LayoutMsg>(layout_json.trim_start_matches('\u{feff}'))
+        .ok()
+        .map(|msg| msg.result.layout.panes)
+}
+
+/// Width of `pane_id`'s rect from a `pane.layout` response; `None` if it is
+/// missing or degenerate.
+fn pane_width(layout_json: &str, pane_id: &str) -> Option<f64> {
+    let panes = layout_panes(layout_json)?;
+    let rect = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))?
+        .rect
+        .as_ref()?;
+    (rect.width > 0).then_some(rect.width as f64)
+}
+
+/// The pane directly beside `pane_id` (sharing vertical overlap), from a
+/// `pane.layout` response — to its left when `on_the_left`, else its right.
+fn side_neighbor(layout_json: &str, pane_id: &str, on_the_left: bool) -> Option<String> {
+    let panes = layout_panes(layout_json)?;
     let me = panes
         .iter()
         .find(|p| p.pane_id.as_deref() == Some(pane_id))?
         .rect
         .as_ref()?;
-    let (my_right, my_top, my_bottom) = (me.x + me.width, me.y, me.y + me.height);
+    let (my_top, my_bottom) = (me.y, me.y + me.height);
     panes
         .iter()
         .filter(|p| p.pane_id.as_deref() != Some(pane_id))
         .filter_map(|p| Some((p.pane_id.clone()?, p.rect.as_ref()?)))
-        .find(|(_, r)| r.x == my_right && r.y < my_bottom && r.y + r.height > my_top)
+        .find(|(_, r)| {
+            let touches = if on_the_left {
+                r.x + r.width == me.x
+            } else {
+                r.x == me.x + me.width
+            };
+            touches && r.y < my_bottom && r.y + r.height > my_top
+        })
         .map(|(id, _)| id)
 }
 
@@ -2498,9 +2739,9 @@ mod tests {
             {"pane_id":"w4:p3","tab_id":"w4:t3",
              "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/b.rs","hs-preview-pinned":"1"}}
         ]}}"#;
-        assert!(reusable_preview(&previews_in(before)).is_some());
+        assert!(reusable_preview(&previews_in(before), false).is_some());
         assert!(
-            reusable_preview(&previews_in(after)).is_none(),
+            reusable_preview(&previews_in(after), false).is_none(),
             "pinning must push the next file onto a new tab"
         );
         // ...and the pinned tab is still reachable by its document.
@@ -2528,7 +2769,7 @@ mod tests {
     #[test]
     fn preview_control_path_travels_in_the_spawn_environment() {
         let control = Path::new("C:/plugin state/preview control.ctl");
-        let env = preview_spawn_env(control);
+        let env = preview_spawn_env(control, false);
         assert_eq!(
             env.get(crate::state::PREVIEW_CONTROL_ENV)
                 .and_then(|value| value.as_str()),
@@ -2594,7 +2835,7 @@ mod tests {
             .cloned()
             .collect();
         assert!(
-            reusable_preview(&tremor).is_none(),
+            reusable_preview(&tremor, false).is_none(),
             "learnings' ephemeral tab must not be reusable from tremor"
         );
         let learnings: Vec<_> = all
@@ -2602,7 +2843,7 @@ mod tests {
             .filter(|p| p.workspace_id == "wB")
             .cloned()
             .collect();
-        assert_eq!(reusable_preview(&learnings).unwrap().pane_id, "wB:pE");
+        assert_eq!(reusable_preview(&learnings, false).unwrap().pane_id, "wB:pE");
 
         // Matching an already-open document is scoped too: jumping to another
         // workspace's tab is the same teleport by a different route.
@@ -2642,7 +2883,7 @@ mod tests {
     fn only_unpinned_previews_are_reusable() {
         let ps = previews_in(PREVIEWS);
         assert_eq!(
-            reusable_preview(&ps).unwrap().doc_token,
+            reusable_preview(&ps, false).unwrap().doc_token,
             document_token("/r/b.rs")
         );
 
@@ -2651,7 +2892,7 @@ mod tests {
              "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/a.rs","hs-preview-pinned":"1"}}
         ]}}"#;
         assert!(
-            reusable_preview(&previews_in(all_pinned)).is_none(),
+            reusable_preview(&previews_in(all_pinned), false).is_none(),
             "every tab pinned must force a new tab"
         );
     }
@@ -2676,9 +2917,182 @@ mod tests {
             pane_id: "w4:p3".into(),
             tab_id: "w4:t3".into(),
             origin_tab_id: "w4:t1".into(),
+            inline: false,
         };
         assert!(target_is_showing(&previews, &target, "/r/b.rs"));
         assert!(!target_is_showing(&previews, &target, "/r/other.rs"));
+    }
+
+    /// `sidebar | rest`, and the same tab mirrored for a right dock.
+    fn layout(panes: &str) -> String {
+        format!(r#"{{"result":{{"layout":{{"panes":[{panes}]}}}}}}"#)
+    }
+
+    const SIDEBAR_LEFT: &str = r#"
+        {"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":32,"height":50}},
+        {"pane_id":"w1:p2","rect":{"x":32,"y":0,"width":148,"height":50}}"#;
+    const SIDEBAR_RIGHT: &str = r#"
+        {"pane_id":"w1:p2","rect":{"x":0,"y":0,"width":148,"height":50}},
+        {"pane_id":"w1:p1","rect":{"x":148,"y":0,"width":32,"height":50}}"#;
+
+    /// The inline viewer goes between the sidebar and the user's panes, on
+    /// whichever side is away from the dock edge — the sidebar must not be
+    /// pushed off its own edge.
+    #[test]
+    fn an_inline_preview_splits_the_neighbour_away_from_the_dock_edge() {
+        let left = inline_split_plan(
+            &layout(SIDEBAR_LEFT),
+            "w1:p1",
+            InlineSpawn { dock_right: false, sidebar_cols: 32 },
+        )
+        .unwrap();
+        // Split only goes right, so the neighbour is halved and the fresh
+        // pane swapped into the half nearest us.
+        assert_eq!(left, SplitPlan { target: "w1:p2".into(), ratio: 0.5, swap: true });
+
+        let right = inline_split_plan(
+            &layout(SIDEBAR_RIGHT),
+            "w1:p1",
+            InlineSpawn { dock_right: true, sidebar_cols: 32 },
+        )
+        .unwrap();
+        // Splitting the LEFT neighbour rightwards already lands the new pane
+        // between it and the sidebar — no swap needed.
+        assert_eq!(right, SplitPlan { target: "w1:p2".into(), ratio: 0.5, swap: false });
+    }
+
+    /// A tab whose only pane is the sidebar: we give away everything past our
+    /// own column target instead of an arbitrary half.
+    #[test]
+    fn an_inline_preview_alone_in_a_tab_keeps_the_sidebar_column_target() {
+        let alone = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":160,"height":50}}"#);
+        let left = inline_split_plan(
+            &alone,
+            "w1:p1",
+            InlineSpawn { dock_right: false, sidebar_cols: 32 },
+        )
+        .unwrap();
+        assert_eq!(left.target, "w1:p1");
+        assert!(!left.swap);
+        assert!((left.ratio - 0.2).abs() < 1e-9, "{}", left.ratio);
+
+        // Docked right we end up in the far slot, so the ratio (the ORIGINAL
+        // pane's share) is the complement of the share we want to keep.
+        let right = inline_split_plan(
+            &alone,
+            "w1:p1",
+            InlineSpawn { dock_right: true, sidebar_cols: 32 },
+        )
+        .unwrap();
+        assert!(right.swap);
+        assert!((right.ratio - 0.8).abs() < 1e-9, "{}", right.ratio);
+
+        // herdr clamps split ratios anyway; never ask for something absurd.
+        let narrow = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":40,"height":50}}"#);
+        let clamped = inline_split_plan(
+            &narrow,
+            "w1:p1",
+            InlineSpawn { dock_right: false, sidebar_cols: 80 },
+        )
+        .unwrap();
+        assert!((clamped.ratio - 0.5).abs() < 1e-9, "{}", clamped.ratio);
+    }
+
+    #[test]
+    fn fallback_plan_mirrors_a_right_docked_sidebar() {
+        let left = fallback_inline_split_plan(
+            "w1:p1",
+            InlineSpawn { dock_right: false, sidebar_cols: 32 },
+        );
+        assert_eq!(
+            left,
+            SplitPlan { target: "w1:p1".into(), ratio: 0.3, swap: false }
+        );
+
+        let right = fallback_inline_split_plan(
+            "w1:p1",
+            InlineSpawn { dock_right: true, sidebar_cols: 32 },
+        );
+        assert_eq!(
+            right,
+            SplitPlan { target: "w1:p1".into(), ratio: 0.7, swap: true }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_layout_leaves_the_caller_to_fall_back() {
+        assert!(
+            inline_split_plan(
+                "not json",
+                "w1:p1",
+                InlineSpawn { dock_right: false, sidebar_cols: 32 }
+            )
+            .is_none()
+        );
+        // Zero-width rects would divide by nothing.
+        let degenerate = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":0,"height":50}}"#);
+        assert!(
+            inline_split_plan(
+                &degenerate,
+                "w1:p1",
+                InlineSpawn { dock_right: false, sidebar_cols: 32 }
+            )
+            .is_none()
+        );
+    }
+
+    /// Inline previews stay reusable even once a dirty editor would have
+    /// pinned them: there is no second tab for the next click to land in, so
+    /// refusing would split the tab again on every file.
+    #[test]
+    fn inline_previews_are_reusable_regardless_of_pin_state() {
+        let pinned = r#"{"result":{"panes":[
+            {"pane_id":"w4:p2","tab_id":"w4:t1","workspace_id":"w4",
+             "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/a.rs",
+                       "hs-preview-pinned":"1","hs-preview-inline":"1"}}
+        ]}}"#;
+        let previews = previews_in(pinned);
+        assert!(previews[0].inline);
+        assert!(!previews[0].dedicated, "an inline viewer never owns its tab");
+        assert!(reusable_preview(&previews, true).is_some());
+        assert!(reusable_preview(&previews, false).is_none());
+    }
+
+    #[test]
+    fn a_tab_mode_preview_is_not_inline() {
+        assert!(!previews_in(PREVIEWS)[0].inline);
+    }
+
+    #[test]
+    fn the_inline_flag_travels_in_the_spawn_environment() {
+        let control = Path::new("C:/plugin state/preview control.ctl");
+        assert!(
+            preview_spawn_env(control, false)
+                .get(crate::state::PREVIEW_INLINE_ENV)
+                .is_none()
+        );
+        assert_eq!(
+            preview_spawn_env(control, true)
+                .get(crate::state::PREVIEW_INLINE_ENV)
+                .and_then(|value| value.as_str()),
+            Some("1")
+        );
+    }
+
+    /// Pinning is a tab-bar concept. Inline placement has no tab of its own,
+    /// so a double click must report success rather than warn about a
+    /// confirmation that could never arrive.
+    #[test]
+    fn pinning_an_inline_target_is_a_silent_no_op() {
+        assert!(pin_target(
+            &PreviewTarget {
+                pane_id: "w4:p3".into(),
+                tab_id: "w4:t3".into(),
+                origin_tab_id: "w4:t3".into(),
+                inline: true,
+            },
+            "/r/b.rs"
+        ));
     }
 
     #[test]
@@ -2706,7 +3120,7 @@ mod tests {
         let previews = previews_in(stale);
         assert!(previews[0].stale);
         assert!(preview_for_doc(&previews, "/r/b.rs").is_none());
-        assert!(reusable_preview(&previews).is_none());
+        assert!(reusable_preview(&previews, false).is_none());
     }
 
     #[test]
@@ -2721,7 +3135,7 @@ mod tests {
         assert!(previews[0].resumed);
         assert!(previews[0].doc_token.is_empty());
         assert!(preview_for_doc(&previews, "/r/b.rs").is_none());
-        assert!(reusable_preview(&previews).is_none());
+        assert!(reusable_preview(&previews, false).is_none());
     }
 
     #[test]
@@ -2768,6 +3182,17 @@ mod tests {
         assert_eq!(tab_label("show:/repo:abc123:src/lib.rs", true), "lib.rs");
         assert_eq!(preview_pane_label("main.rs"), "main.rs · preview");
         assert_eq!(editor_pane_label("main.rs"), "main.rs · editor");
+    }
+
+    #[test]
+    fn pane_close_failure_keeps_the_inline_viewer_running() {
+        assert!(!pane_close_succeeded(Err(std::io::Error::other(
+            "socket closed",
+        ))));
+        assert!(!pane_close_succeeded(Ok(
+            r#"{"error":{"message":"nope"}}"#.into()
+        )));
+        assert!(pane_close_succeeded(Ok(r#"{"result":{}}"#.into())));
     }
 
     #[test]

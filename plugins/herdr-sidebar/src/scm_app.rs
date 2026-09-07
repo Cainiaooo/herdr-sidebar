@@ -29,10 +29,10 @@ use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
-    hits_collapse_button, hover_style, keep_visible_scroll, palette, selection_style,
-    set_color_theme, sibling_panes_of, sparkle_icon, status_color, title_action_spans,
-    title_actions_visible, title_actions_width, truncate_to, within, wrap_footer_message,
-    wrap_hints,
+    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
+    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
+    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
+    wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -408,6 +408,7 @@ enum Setting {
     SidebarWidth,
     IconTheme,
     ColorTheme,
+    PreviewPlacement,
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
@@ -1821,6 +1822,12 @@ impl App {
                 true,
             ),
             (
+                Setting::PreviewPlacement,
+                "Preview opens in",
+                self.sidebar_state.preview_placement.label().to_string(),
+                true,
+            ),
+            (
                 Setting::Hotkeys,
                 "Footer hotkeys",
                 if self.show_hotkeys() {
@@ -1921,9 +1928,14 @@ impl App {
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
-                    state.color_theme = state.color_theme.other();
+                    state.color_theme = state.color_theme.next();
                 });
                 set_color_theme(self.sidebar_state.color_theme);
+            }
+            Setting::PreviewPlacement => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.preview_placement = state.preview_placement.other();
+                });
             }
             Setting::Hotkeys => {
                 self.sidebar_state =
@@ -3198,11 +3210,11 @@ impl App {
     fn draw_button(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Commit;
         let bg = if focused {
-            palette().accent_focus
+            palette().button_focus_bg
         } else {
-            palette().accent
+            palette().button_bg
         };
-        let mut style = Style::default().bg(bg).fg(palette().accent_fg);
+        let mut style = Style::default().bg(bg).fg(palette().button_fg);
         if focused {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -3246,7 +3258,7 @@ impl App {
         } else {
             Style::default()
                 .bg(palette().sync_bg)
-                .fg(palette().accent_fg)
+                .fg(palette().sync_fg)
         };
         frame.render_widget(Paragraph::new(label).centered().style(style), area);
     }
@@ -3698,8 +3710,8 @@ fn message_box_item(
 /// right end; only the active repo's button is fully lit.
 fn commit_button_item(active: bool, focused: bool, width: usize) -> ListItem<'static> {
     let (bg, fg) = match (active, focused) {
-        (true, true) => (palette().accent_focus, palette().accent_fg),
-        (true, false) => (palette().accent, palette().accent_fg),
+        (true, true) => (palette().button_focus_bg, palette().button_fg),
+        (true, false) => (palette().button_bg, palette().button_fg),
         (false, _) => (palette().muted_button_bg, palette().muted_button_fg),
     };
     let label = "✓ Commit";
@@ -3740,8 +3752,8 @@ fn section_item(
     let badge = Span::styled(
         format!(" {count} "),
         Style::default()
-            .bg(palette().accent)
-            .fg(palette().accent_fg),
+            .bg(palette().button_bg)
+            .fg(palette().button_fg),
     );
     // Hovering shows the section-wide stage/unstage glyph before the badge.
     let action_span = action.map(|a| Span::styled(format!("{a} "), Style::default().bold()));
@@ -3793,10 +3805,7 @@ fn file_item(
     };
     let color = status_color(entry.letter);
     let file_icon = icon(theme, name, false, false);
-    let icon_style = match file_icon.rgb {
-        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
-        None => Style::default(),
-    };
+    let icon_style = ui_icon_style(file_icon.rgb);
     let mut spans = vec![
         Span::raw("   "),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),

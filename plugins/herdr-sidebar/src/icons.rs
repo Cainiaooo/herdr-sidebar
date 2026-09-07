@@ -72,11 +72,40 @@ impl IconTheme {
 /// space-less filenames ("CaskaydiaCoveNerdFont-Regular.ttf").
 fn output_mentions_nerd_font(text: &str) -> bool {
     let t = text.to_lowercase();
-    t.contains("nerd font") || t.contains("nerdfont") || t.contains(" nf ")
+    t.contains("nerd font")
+        || t.contains("nerdfont")
+        || t.contains(" nf ")
+        || t.contains("nf-")
+        || t.contains("nf_")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn font_dirs_mention_nerd_font(dirs: impl IntoIterator<Item = std::path::PathBuf>) -> bool {
+    dirs.into_iter().any(|dir| {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| output_mentions_nerd_font(&entry.file_name().to_string_lossy()))
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_font_dirs_mention_nerd_font() -> bool {
+    let mut dirs = vec![
+        std::path::PathBuf::from("/Library/Fonts"),
+        std::path::PathBuf::from("/System/Library/Fonts"),
+        std::path::PathBuf::from("/Network/Library/Fonts"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join("Library/Fonts"));
+    }
+    font_dirs_mention_nerd_font(dirs)
 }
 
 /// Best-effort "is any Nerd Font installed" probe, cached. Windows: the two
-/// font registries; elsewhere: `fc-list`. Installed is not the same as
+/// font registries; macOS: standard font directories; Linux:
+/// `fc-list`. Installed is not the same as
 /// selected in the terminal profile, but it is the strongest hint a TUI can
 /// get, and the safe default for machines without one is what matters.
 pub fn nerd_font_installed() -> bool {
@@ -103,7 +132,11 @@ pub fn probe_nerd_font() -> bool {
                 .unwrap_or(false)
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_font_dirs_mention_nerd_font()
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         std::process::Command::new("fc-list")
             .output()
@@ -402,8 +435,23 @@ mod tests {
             r"CaskaydiaCove NF Mono (TrueType)    REG_SZ    C:\x\CaskaydiaCoveNerdFontMono-Regular.ttf"
         ));
         assert!(output_mentions_nerd_font("JetBrainsMono Nerd Font: style=Regular"));
+        assert!(output_mentions_nerd_font("FiraCode Nerd Font: style=Regular"));
         assert!(output_mentions_nerd_font("FiraCode NF Retina (TrueType)"));
+        assert!(output_mentions_nerd_font("FiraCodeNF-Regular.ttf"));
         assert!(!output_mentions_nerd_font("Consolas (TrueType)  Segoe UI  Cascadia Mono"));
+    }
+
+    #[test]
+    fn font_directory_probe_checks_file_names_without_platform_tools() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-font-probe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("FiraCodeNF-Regular.ttf"), []).unwrap();
+        assert!(font_dirs_mention_nerd_font([root.clone()]));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

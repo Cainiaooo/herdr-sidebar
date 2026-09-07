@@ -68,7 +68,7 @@ pub fn run(toggle: bool) -> std::io::Result<()> {
     let scope = if toggle {
         String::new()
     } else {
-        launch::event_scope(&event_json)
+        launch::event_scope_in(&event_json, &panes)
     };
     // Hide/`b` and the open-sidebar toggle record a per-workspace preference
     // that outranks the global Auto-open default. Quiet hooks never write it.

@@ -9,14 +9,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::syntax::LineHighlighter;
+use crate::ui::palette;
 
-/// Row tints (VS Code dark diff editor vibes).
-const DEL_BG: Color = Color::Rgb(0x42, 0x22, 0x26);
-const DEL_WORD_BG: Color = Color::Rgb(0x6f, 0x30, 0x36);
-const ADD_BG: Color = Color::Rgb(0x20, 0x39, 0x28);
-const ADD_WORD_BG: Color = Color::Rgb(0x35, 0x59, 0x3d);
-const DEL_MARK: Color = Color::Rgb(0xd1, 0x6d, 0x76);
-const ADD_MARK: Color = Color::Rgb(0x8c, 0xc9, 0x8f);
+// Row tints live in `ui::Palette` (`diff_*`) so the light theme can swap them
+// for GitHub-light tints without a second copy of this renderer.
 
 /// One parsed diff line, before rendering.
 #[derive(Debug, PartialEq, Eq)]
@@ -219,6 +215,7 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
         ]
     };
 
+    let colors = palette();
     let mut lines = Vec::new();
     for (idx, ev) in evs.iter().enumerate() {
         match ev {
@@ -240,20 +237,20 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
             Ev::Del(o, t) => {
                 let mut spans = old_hl.line(t);
                 if let Some(&range) = ranges.get(&idx) {
-                    spans = overlay_bg(spans, range, DEL_WORD_BG);
+                    spans = overlay_bg(spans, range, colors.diff_del_word_bg);
                 }
-                let mut all = gutter(Some(*o), None, "-", DEL_MARK);
+                let mut all = gutter(Some(*o), None, "-", colors.diff_del_mark);
                 all.extend(spans);
-                lines.push(Line::from(all).style(Style::default().bg(DEL_BG)));
+                lines.push(Line::from(all).style(Style::default().bg(colors.diff_del_bg)));
             }
             Ev::Add(n, t) => {
                 let mut spans = new_hl.line(t);
                 if let Some(&range) = ranges.get(&idx) {
-                    spans = overlay_bg(spans, range, ADD_WORD_BG);
+                    spans = overlay_bg(spans, range, colors.diff_add_word_bg);
                 }
-                let mut all = gutter(None, Some(*n), "+", ADD_MARK);
+                let mut all = gutter(None, Some(*n), "+", colors.diff_add_mark);
                 all.extend(spans);
-                lines.push(Line::from(all).style(Style::default().bg(ADD_BG)));
+                lines.push(Line::from(all).style(Style::default().bg(colors.diff_add_bg)));
             }
         }
     }
@@ -281,6 +278,7 @@ mod tests {
 
     #[test]
     fn diff_parses_gutters_tints_and_word_ranges() {
+        let colors = palette();
         let lines = render("app.ts", DIFF);
         assert_eq!(lines.len(), 5);
         // Context row: both numbers, no tint.
@@ -288,20 +286,20 @@ mod tests {
         assert_eq!(lines[0].style.bg, None);
         // Deletion: old number only, red row tint.
         assert!(lines[1].to_string().contains('-'));
-        assert_eq!(lines[1].style.bg, Some(DEL_BG));
+        assert_eq!(lines[1].style.bg, Some(colors.diff_del_bg));
         // Addition: new number only, green row tint.
-        assert_eq!(lines[2].style.bg, Some(ADD_BG));
+        assert_eq!(lines[2].style.bg, Some(colors.diff_add_bg));
         // The paired del/add carry a darker word-level tint on the middle.
         let word_tinted = lines[1]
             .spans
             .iter()
-            .any(|s| s.style.bg == Some(DEL_WORD_BG));
+            .any(|s| s.style.bg == Some(colors.diff_del_word_bg));
         assert!(word_tinted, "expected word-level tint on the deletion");
         // The unpaired trailing addition has no word tint.
         let plain_add = lines[3]
             .spans
             .iter()
-            .all(|s| s.style.bg != Some(ADD_WORD_BG));
+            .all(|s| s.style.bg != Some(colors.diff_add_word_bg));
         assert!(plain_add);
     }
 

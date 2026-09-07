@@ -6,7 +6,28 @@ It is not the upstream GitHub release notes.
 
 How to maintain this fork: [`FORK.md`](FORK.md).
 
-Base: upstream `13ebde8` (after PR #39, 2026-08).
+Base: upstream `4faeea7` (v0.11.0, 2026-09-02).
+
+---
+
+## 2026-09-07 — merge upstream v0.11.0
+
+Pulled Quick Open (`Ctrl+P`), light theme, and inline preview from
+`alexarthurs/herdr-sidebar` v0.11.0. Kept this fork's per-workspace visibility,
+`prefix+shift+b` plugin toggle, configurable commit-message oneshot, and the
+SCM scroll snap so Staged/Changes stay on screen.
+
+Conflict resolutions:
+
+- `launch.rs`: keep `event_field` (pane id) and take upstream `event_scope_in`
+  so `pane.focused` docks the event's own tab.
+- `ensure-sidebar.sh`: still reads workspace-keyed auto-open before the lock,
+  then re-reads scope from the pane snapshot after it.
+- `CLAUDE.md`: keep both the scroll-snap gotcha and the Quick Open notes.
+- `.github/workflows/release.yml`: keep `actions/upload-artifact@v4`. Upstream
+  bumped it to v7, but `gh`'s OAuth token (`repo`, `gist`, `read:org`) cannot
+  push workflow-file changes without the `workflow` scope, and that blocked
+  the whole merge. Bump it after `gh auth refresh -s workflow`.
 
 ---
 

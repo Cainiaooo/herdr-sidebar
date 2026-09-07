@@ -72,6 +72,14 @@ A real tree, not a directory dump:
   that opened it. Line numbers, scrolling,
   binary-safe, and **long lines wrap** — press `w` to switch wrapping off for the
   document you are reading.
+- **Rather stay in one tab?** Set "Preview opens in" to `pane` in ⚙ Settings and the
+  preview splits in right beside the sidebar instead, in the tab you clicked from —
+  one viewer pane per tab, reused for every file, with focus left in the tree so you
+  can keep walking it with the arrow keys. `q` or Esc closes just that pane.
+- **Quick-open any file with `Ctrl+P`** — type a few characters from its path, use
+  `↑`/`↓` to choose a fuzzy match, and press Enter to open it through the same reusable
+  preview flow. The index follows the Explorer's dotfile setting, honors git ignore rules,
+  and always skips `.git`.
 - **Experimental in-pane editing** — press `e` in a regular UTF-8 file preview. The editor
   has a visible cursor, word-aware wrapping, wrapped-row scrolling, click/drag selection, find, and
   best-effort system clipboard integration. Saving is always explicit; unsaved exits and
@@ -110,8 +118,9 @@ A real tree, not a directory dump:
   persists for every future launch and auto-docked tab.
 - Prefer a different width? Adjust "Sidebar width" with `←`/`→` in ⚙ Settings. The column
   target persists and is re-applied when the surrounding tab width changes.
-- Prefer your terminal's palette? Switch "Color theme" to `terminal`; ANSI accents then
-  follow the terminal profile while `vscode` preserves the original fixed RGB colors.
+- On a light terminal? Switch "Color theme" to `light`; it updates the complete sidebar,
+  preview syntax, diffs, selections, and icons. `terminal` uses profile-mapped ANSI accents,
+  while `vscode` preserves the original fixed dark palette and remains the default.
 
 ### 🔀 Source Control
 

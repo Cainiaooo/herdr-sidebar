@@ -64,7 +64,7 @@ fn main() -> std::io::Result<()> {
         }
         Some("--event-scope") => {
             let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
-            println!("{}", launch::event_scope(&payload));
+            println!("{}", launch::event_scope_in(&payload, &read_stdin()?));
             return Ok(());
         }
         Some("--open-plan") => {
@@ -148,6 +148,10 @@ fn main() -> std::io::Result<()> {
                 );
                 std::process::exit(2);
             };
+            // The viewer is its own process: it must apply the persisted
+            // color theme itself, or a preview pane keeps the default palette
+            // (and a dark syntax theme) whatever the user chose.
+            herdr_sidebar::ui::set_color_theme(state::load_state().color_theme);
             return viewer::run(std::path::Path::new(&control));
         }
         Some("--view") => {}
@@ -199,13 +203,27 @@ fn main() -> std::io::Result<()> {
     herdr_sidebar::fontsetup::maybe_prompt(&mut terminal, view, persisted.merged)?;
     let cwd_follower = Rc::new(RefCell::new(launch::CwdFollower::default()));
     let workspace_label = workspace_label();
+    let spawn_cwd = std::env::current_dir()?;
+    let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
     let result = loop {
         let exit = match view {
             View::Explorer => {
-                run_explorer(&mut terminal, Rc::clone(&cwd_follower), &workspace_label)
+                run_explorer(
+                    &mut terminal,
+                    Rc::clone(&cwd_follower),
+                    &root_key,
+                    &workspace_label,
+                    &spawn_cwd,
+                )
             }
             View::SourceControl => {
-                run_scm(&mut terminal, Rc::clone(&cwd_follower), &workspace_label)
+                run_scm(
+                    &mut terminal,
+                    Rc::clone(&cwd_follower),
+                    &root_key,
+                    &workspace_label,
+                    &spawn_cwd,
+                )
             }
         };
         match exit {
@@ -236,22 +254,43 @@ fn workspace_label() -> String {
         .unwrap_or_default()
 }
 
-/// The directory the tree is built from: the root this space remembers,
+/// Roots are project state, not workspace state: one Herdr workspace may host
+/// unrelated project tabs, while tab ids change across server restarts.
+fn remembered_root_key(workspace_label: &str, spawn_cwd: &std::path::Path) -> String {
+    let mut cwd = spawn_cwd.display().to_string().replace('\\', "/");
+    if cfg!(windows) {
+        cwd.make_ascii_lowercase();
+    }
+    format!("{workspace_label}::{cwd}")
+}
+
+/// The directory the tree is built from: the root this tab remembers,
 /// else the cwd the pane was spawned with.
 ///
-/// The spawn cwd is only a guess — the ensure hook takes it from whichever
-/// pane happened to be focused — so a remembered choice always wins. A
-/// remembered root that has since been deleted is ignored rather than
-/// yielding an empty tree.
-fn resolve_root(workspace_label: &str) -> std::io::Result<std::path::PathBuf> {
-    let root = if let Some(root) = herdr_sidebar::state::load_root(workspace_label)
+/// A remembered root that has since been deleted is ignored rather than
+/// yielding an empty tree. The guarded legacy lookup migrates v0.10's
+/// workspace-keyed entry only when it contains this tab's spawn cwd.
+fn resolve_root(
+    root_key: &str,
+    legacy_workspace_label: &str,
+    spawn_cwd: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let root = if let Some(root) = herdr_sidebar::state::load_root(root_key)
         && root.is_dir()
     {
         root
+    } else if let Some(root) = herdr_sidebar::state::load_root(legacy_workspace_label)
+        && root.is_dir()
+        && spawn_cwd.starts_with(&root)
+    {
+        // v0.10 keyed roots by workspace label. Migrate that choice only
+        // when it contains this tab's live spawn cwd; sibling project tabs
+        // must not all inherit the same old entry.
+        root
     } else {
-        std::env::current_dir()?
+        spawn_cwd.to_path_buf()
     };
-    herdr_sidebar::state::save_root(workspace_label, &root);
+    herdr_sidebar::state::save_root(root_key, &root);
     Ok(root)
 }
 
@@ -260,9 +299,11 @@ fn resolve_root(workspace_label: &str) -> std::io::Result<std::path::PathBuf> {
 fn run_explorer(
     terminal: &mut ratatui::DefaultTerminal,
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
-    workspace_label: &str,
+    root_key: &str,
+    legacy_workspace_label: &str,
+    spawn_cwd: &std::path::Path,
 ) -> std::io::Result<Exit> {
-    let root = resolve_root(workspace_label)?;
+    let root = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
     let mut remembered_root = root.clone();
     let mut app = explorer_app::App::new(root, cwd_follower);
     loop {
@@ -291,7 +332,7 @@ fn run_explorer(
         app.tick();
         let root = app.root_path();
         if root != remembered_root {
-            herdr_sidebar::state::save_root(workspace_label, &root);
+            herdr_sidebar::state::save_root(root_key, &root);
             remembered_root = root;
         }
     }
@@ -302,9 +343,11 @@ fn run_explorer(
 fn run_scm(
     terminal: &mut ratatui::DefaultTerminal,
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
-    workspace_label: &str,
+    root_key: &str,
+    legacy_workspace_label: &str,
+    spawn_cwd: &std::path::Path,
 ) -> std::io::Result<Exit> {
-    let cwd = resolve_root(workspace_label)?;
+    let cwd = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
     let mut remembered_root = cwd.clone();
     let mut app = scm_app::App::new(cwd, cwd_follower);
     let mut last_tick = std::time::Instant::now();
@@ -342,8 +385,24 @@ fn run_scm(
         }
         let root = app.root_path().to_path_buf();
         if root != remembered_root {
-            herdr_sidebar::state::save_root(workspace_label, &root);
+            herdr_sidebar::state::save_root(root_key, &root);
             remembered_root = root;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remembered_root_keys_are_project_stable_not_tab_scoped() {
+        let key = remembered_root_key("acme", std::path::Path::new(r"C:\Repo\Web"));
+        assert!(key.starts_with("acme::"));
+        assert!(!key.contains('\\'));
+        assert!(!key.contains("w1:t"));
+        if cfg!(windows) {
+            assert_eq!(key, "acme::c:/repo/web");
         }
     }
 }

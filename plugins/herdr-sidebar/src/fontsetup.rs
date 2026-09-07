@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
@@ -359,7 +359,11 @@ fn done_ok_lines(probe_ok: bool, width: u16, height: usize) -> Vec<Line<'static>
     let mut blocks = vec![
         (
             4,
-            wrapped("Installed — one step left", width, Style::default().bold().fg(Color::Green)),
+            wrapped(
+                "Installed — one step left",
+                width,
+                Style::default().bold().fg(palette().added),
+            ),
         ),
         (
             3,
@@ -409,13 +413,20 @@ fn done_err_lines(err: &str, copied: bool, width: u16, height: usize) -> Vec<Lin
     options.extend(option_lines("⏎", "continue with emoji icons", width));
     fit_blocks(
         vec![
-            (5, wrapped("Install failed", width, Style::default().bold().fg(Color::Red))),
+            (
+                5,
+                wrapped(
+                    "Install failed",
+                    width,
+                    Style::default().bold().fg(palette().deleted),
+                ),
+            ),
             (1, wrapped(err, width, Style::default())),
             (
                 3,
                 [
                     wrapped("Install it manually by running:", width, Style::default()),
-                    wrapped(MANUAL_CMD, width, Style::default().fg(Color::Yellow)),
+                    wrapped(MANUAL_CMD, width, Style::default().fg(palette().warning)),
                 ]
                 .concat(),
             ),

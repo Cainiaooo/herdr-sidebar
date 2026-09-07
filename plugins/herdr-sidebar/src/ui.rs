@@ -31,12 +31,38 @@ pub struct Palette {
     pub hover_bg: Color,
     pub accent: Color,
     pub accent_focus: Color,
-    pub accent_fg: Color,
+    /// Filled buttons (✓ Commit, the section count badge). The dark themes
+    /// fill them with the accent; the light theme uses a soft tint with dark
+    /// blue text, because a saturated blue block dominates a white pane.
+    pub button_bg: Color,
+    pub button_focus_bg: Color,
+    pub button_fg: Color,
     pub muted_button_bg: Color,
     pub muted_button_fg: Color,
     pub sync_bg: Color,
     pub sync_busy_bg: Color,
+    /// Sync Changes' label. It sits on `sync_bg`, NOT on the accent, so it
+    /// cannot borrow `button_fg` — white on a light grey button is invisible.
+    pub sync_fg: Color,
     pub header_accent: Color,
+    /// Row foregrounds that go with the three row backgrounds above.
+    /// `Color::Reset` = keep the terminal's own foreground.
+    pub selection_fg: Color,
+    pub selection_unfocused_fg: Color,
+    pub hover_fg: Color,
+    /// Mouse text selection in the preview / editor. Unlike the list rows this
+    /// sits UNDER syntax-colored spans, so it must not fight their foreground.
+    pub text_selection_bg: Color,
+    /// Diff row tints (`diffview`), word-level tint, and the +/− gutter marks.
+    pub diff_del_bg: Color,
+    pub diff_del_word_bg: Color,
+    pub diff_add_bg: Color,
+    pub diff_add_word_bg: Color,
+    pub diff_del_mark: Color,
+    pub diff_add_mark: Color,
+    /// Advisory text (the editor's "experimental" tag, the font installer's
+    /// manual command) — `Yellow` is illegible on a light background.
+    pub warning: Color,
 }
 
 // VS Code's dark-theme git decoration colors, shared by the Source Control
@@ -57,12 +83,70 @@ const VSCODE_PALETTE: Palette = Palette {
     hover_bg: Color::Rgb(48, 52, 60),
     accent: Color::Rgb(0x00, 0x78, 0xd4),
     accent_focus: Color::Rgb(0x02, 0x8a, 0xf0),
-    accent_fg: Color::White,
+    button_bg: Color::Rgb(0x00, 0x78, 0xd4),
+    button_focus_bg: Color::Rgb(0x02, 0x8a, 0xf0),
+    button_fg: Color::White,
     muted_button_bg: Color::Rgb(0x24, 0x45, 0x5c),
     muted_button_fg: Color::Rgb(0x9a, 0xb2, 0xc2),
     sync_bg: Color::Rgb(0x3a, 0x3d, 0x41),
     sync_busy_bg: Color::Rgb(0x2d, 0x2d, 0x33),
+    sync_fg: Color::White,
     header_accent: Color::LightBlue,
+    selection_fg: Color::Reset,
+    selection_unfocused_fg: Color::Reset,
+    hover_fg: Color::Reset,
+    text_selection_bg: Color::DarkGray,
+    diff_del_bg: Color::Rgb(0x42, 0x22, 0x26),
+    diff_del_word_bg: Color::Rgb(0x6f, 0x30, 0x36),
+    diff_add_bg: Color::Rgb(0x20, 0x39, 0x28),
+    diff_add_word_bg: Color::Rgb(0x35, 0x59, 0x3d),
+    diff_del_mark: Color::Rgb(0xd1, 0x6d, 0x76),
+    diff_add_mark: Color::Rgb(0x8c, 0xc9, 0x8f),
+    warning: Color::Yellow,
+};
+
+// The same vocabulary drawn for a LIGHT terminal background: VS Code Light+
+// git decorations, GitHub-light diff tints. Every value here is picked to stay
+// readable on white — nothing may rely on a dark background showing through.
+const LIGHT_PALETTE: Palette = Palette {
+    keycap_bg: Color::Rgb(0xdd, 0xe1, 0xe6),
+    keycap_fg: Color::Rgb(0x24, 0x29, 0x2f),
+    modified: Color::Rgb(0x89, 0x55, 0x03),
+    untracked: Color::Rgb(0x00, 0x71, 0x00),
+    added: Color::Rgb(0x58, 0x7c, 0x0c),
+    renamed: Color::Rgb(0x00, 0x71, 0x00),
+    deleted: Color::Rgb(0xad, 0x07, 0x07),
+    conflict: Color::Rgb(0xb5, 0x20, 0x0d),
+    ignored: Color::Rgb(0x8c, 0x8c, 0x8c),
+    selection_bg: Color::Rgb(0xcc, 0xe3, 0xf5),
+    selection_unfocused_bg: Color::Rgb(0xe4, 0xe6, 0xe8),
+    hover_bg: Color::Rgb(0xec, 0xec, 0xec),
+    accent: Color::Rgb(0x00, 0x78, 0xd4),
+    accent_focus: Color::Rgb(0x02, 0x6e, 0xc1),
+    // A soft fill with dark blue text instead of a solid blue block, and NEVER
+    // `Color::White`: that is ANSI 15, which a light profile draws as a pale
+    // grey — the old solid button read grey-on-blue.
+    button_bg: Color::Rgb(0xd8, 0xea, 0xfc),
+    button_focus_bg: Color::Rgb(0xb6, 0xd8, 0xf8),
+    button_fg: Color::Rgb(0x0a, 0x4a, 0x86),
+    // The inactive repo's button must stay clearly weaker than that tint.
+    muted_button_bg: Color::Rgb(0xec, 0xef, 0xf2),
+    muted_button_fg: Color::Rgb(0x57, 0x61, 0x6b),
+    sync_bg: Color::Rgb(0xdc, 0xdf, 0xe3),
+    sync_busy_bg: Color::Rgb(0xeb, 0xed, 0xef),
+    sync_fg: Color::Rgb(0x24, 0x29, 0x2f),
+    header_accent: Color::Rgb(0x00, 0x58, 0xa8),
+    selection_fg: Color::Rgb(0x0a, 0x0a, 0x0a),
+    selection_unfocused_fg: Color::Rgb(0x1f, 0x1f, 0x1f),
+    hover_fg: Color::Reset,
+    text_selection_bg: Color::Rgb(0xad, 0xd6, 0xff),
+    diff_del_bg: Color::Rgb(0xff, 0xeb, 0xe9),
+    diff_del_word_bg: Color::Rgb(0xff, 0xc1, 0xbc),
+    diff_add_bg: Color::Rgb(0xe6, 0xff, 0xec),
+    diff_add_word_bg: Color::Rgb(0xab, 0xf2, 0xbc),
+    diff_del_mark: Color::Rgb(0xb3, 0x1d, 0x28),
+    diff_add_mark: Color::Rgb(0x1a, 0x7f, 0x37),
+    warning: Color::Rgb(0x9a, 0x67, 0x00),
 };
 
 const TERMINAL_PALETTE: Palette = Palette {
@@ -80,61 +164,91 @@ const TERMINAL_PALETTE: Palette = Palette {
     hover_bg: Color::Black,
     accent: Color::Blue,
     accent_focus: Color::LightBlue,
-    accent_fg: Color::White,
+    button_bg: Color::Blue,
+    button_focus_bg: Color::LightBlue,
+    button_fg: Color::White,
     muted_button_bg: Color::Black,
     muted_button_fg: Color::Gray,
     sync_bg: Color::DarkGray,
     sync_busy_bg: Color::Black,
+    sync_fg: Color::White,
     header_accent: Color::LightBlue,
+    selection_fg: Color::White,
+    selection_unfocused_fg: Color::White,
+    hover_fg: Color::Gray,
+    text_selection_bg: Color::DarkGray,
+    // Diff tints stay RGB in every dark theme: an ANSI background here would
+    // collide with the syntax foregrounds the terminal profile also remaps.
+    diff_del_bg: Color::Rgb(0x42, 0x22, 0x26),
+    diff_del_word_bg: Color::Rgb(0x6f, 0x30, 0x36),
+    diff_add_bg: Color::Rgb(0x20, 0x39, 0x28),
+    diff_add_word_bg: Color::Rgb(0x35, 0x59, 0x3d),
+    diff_del_mark: Color::Rgb(0xd1, 0x6d, 0x76),
+    diff_add_mark: Color::Rgb(0x8c, 0xc9, 0x8f),
+    warning: Color::Yellow,
 };
 
+/// 0 = vscode, 1 = terminal, 2 = light. The numbering is historical: this used
+/// to hold a bool, and `0`/`1` are what an already-running pane reads.
 static ACTIVE_PALETTE: AtomicU8 = AtomicU8::new(0);
 
+fn theme_code(theme: ColorTheme) -> u8 {
+    match theme {
+        ColorTheme::VsCode => 0,
+        ColorTheme::Terminal => 1,
+        ColorTheme::Light => 2,
+    }
+}
+
 pub fn set_color_theme(theme: ColorTheme) {
-    ACTIVE_PALETTE.store(u8::from(theme == ColorTheme::Terminal), Ordering::Relaxed);
+    ACTIVE_PALETTE.store(theme_code(theme), Ordering::Relaxed);
 }
 
 pub fn palette_for(theme: ColorTheme) -> Palette {
     match theme {
         ColorTheme::VsCode => VSCODE_PALETTE,
+        ColorTheme::Light => LIGHT_PALETTE,
         ColorTheme::Terminal => TERMINAL_PALETTE,
     }
 }
 
 pub fn palette() -> Palette {
-    if ACTIVE_PALETTE.load(Ordering::Relaxed) == 1 {
-        TERMINAL_PALETTE
-    } else {
-        VSCODE_PALETTE
-    }
+    palette_for(active_color_theme())
 }
 
 fn active_color_theme() -> ColorTheme {
-    if ACTIVE_PALETTE.load(Ordering::Relaxed) == 1 {
-        ColorTheme::Terminal
-    } else {
-        ColorTheme::VsCode
+    match ACTIVE_PALETTE.load(Ordering::Relaxed) {
+        1 => ColorTheme::Terminal,
+        2 => ColorTheme::Light,
+        _ => ColorTheme::VsCode,
     }
 }
 
+/// The active palette assumes a light terminal background — the preview's
+/// syntax theme and the icon colors branch on this.
+pub fn is_light() -> bool {
+    active_color_theme().is_light()
+}
+
+/// `Style::fg` only when the palette names a foreground; `Color::Reset` means
+/// "leave the terminal's own", which is what the dark palettes want.
+fn with_fg(style: Style, fg: Color) -> Style {
+    if fg == Color::Reset { style } else { style.fg(fg) }
+}
+
 fn selection_style_for(theme: ColorTheme, focused: bool) -> Style {
-    if theme == ColorTheme::Terminal {
-        if focused {
-            Style::default()
-                .bg(TERMINAL_PALETTE.selection_bg)
-                .fg(TERMINAL_PALETTE.keycap_fg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .bg(TERMINAL_PALETTE.selection_unfocused_bg)
-                .fg(Color::White)
-        }
-    } else if focused {
-        Style::default()
-            .bg(VSCODE_PALETTE.selection_bg)
-            .add_modifier(Modifier::BOLD)
+    let colors = palette_for(theme);
+    if focused {
+        with_fg(
+            Style::default().bg(colors.selection_bg),
+            colors.selection_fg,
+        )
+        .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(VSCODE_PALETTE.selection_unfocused_bg)
+        with_fg(
+            Style::default().bg(colors.selection_unfocused_bg),
+            colors.selection_unfocused_fg,
+        )
     }
 }
 
@@ -143,17 +257,47 @@ pub fn selection_style(focused: bool) -> Style {
 }
 
 fn hover_style_for(theme: ColorTheme) -> Style {
-    if theme == ColorTheme::Terminal {
-        Style::default()
-            .bg(TERMINAL_PALETTE.hover_bg)
-            .fg(Color::Gray)
-    } else {
-        Style::default().bg(VSCODE_PALETTE.hover_bg)
-    }
+    let colors = palette_for(theme);
+    with_fg(Style::default().bg(colors.hover_bg), colors.hover_fg)
 }
 
 pub fn hover_style() -> Style {
     hover_style_for(active_color_theme())
+}
+
+/// A file-type icon's fixed color, dimmed into legibility when the terminal
+/// background is light. The icon table (`icons::material`) is tuned for a dark
+/// pane — pale yellows and cyans vanish on white — so cap the relative
+/// luminance instead of maintaining a second color table that would drift.
+pub fn icon_style(rgb: Option<(u8, u8, u8)>) -> Style {
+    icon_style_for(active_color_theme(), rgb)
+}
+
+fn icon_style_for(theme: ColorTheme, rgb: Option<(u8, u8, u8)>) -> Style {
+    match rgb {
+        Some(rgb) => {
+            let (r, g, b) = if theme.is_light() {
+                darken_for_light(rgb)
+            } else {
+                rgb
+            };
+            Style::default().fg(Color::Rgb(r, g, b))
+        }
+        None => Style::default(),
+    }
+}
+
+/// Scale a color toward black until its relative luminance is at most
+/// `MAX_LIGHT_LUMA`, preserving hue. Colors already dark enough pass through.
+fn darken_for_light((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
+    const MAX_LIGHT_LUMA: f32 = 0.42;
+    let luma = (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0;
+    if luma <= MAX_LIGHT_LUMA {
+        return (r, g, b);
+    }
+    let scale = MAX_LIGHT_LUMA / luma;
+    let dim = |c: u8| (f32::from(c) * scale).round().clamp(0.0, 255.0) as u8;
+    (dim(r), dim(g), dim(b))
 }
 
 pub fn keep_visible_scroll(selected: usize, visible: usize, content: usize) -> usize {
@@ -499,6 +643,110 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Perceived brightness on a 0..1 scale, the measure `darken_for_light`
+    /// caps.
+    fn luma(color: Color) -> f32 {
+        match color {
+            Color::Rgb(r, g, b) => {
+                (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
+            }
+            other => panic!("expected an RGB color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn light_palette_foregrounds_stay_dark_and_backgrounds_stay_light() {
+        let light = palette_for(ColorTheme::Light);
+        // Every status/text color must be readable ON WHITE …
+        for fg in [
+            light.modified,
+            light.untracked,
+            light.added,
+            light.renamed,
+            light.deleted,
+            light.conflict,
+            light.keycap_fg,
+            light.header_accent,
+            light.accent,
+            light.muted_button_fg,
+            light.button_fg,
+            light.sync_fg,
+            light.warning,
+            light.diff_del_mark,
+            light.diff_add_mark,
+        ] {
+            assert!(luma(fg) < 0.55, "foreground {fg:?} is too pale on white");
+        }
+        // … and every row/tint background must stay a light wash, so the
+        // terminal's dark default foreground still reads on top of it.
+        for bg in [
+            light.selection_bg,
+            light.selection_unfocused_bg,
+            light.hover_bg,
+            light.keycap_bg,
+            light.text_selection_bg,
+            light.diff_del_bg,
+            light.diff_add_bg,
+            light.diff_del_word_bg,
+            light.diff_add_word_bg,
+            light.sync_bg,
+            light.muted_button_bg,
+            light.button_bg,
+            light.button_focus_bg,
+        ] {
+            assert!(luma(bg) > 0.6, "background {bg:?} is too dark for white");
+        }
+        // ✓ Commit is a soft tint with dark blue text here, so the pair must
+        // hold together on its own — and the label may never be a NAMED color:
+        // `Color::White` is ANSI 15, which a light profile draws as pale grey.
+        assert!(luma(light.button_bg) > 0.6 && luma(light.button_focus_bg) > 0.6);
+        assert!(luma(light.button_fg) < 0.35);
+        assert!(
+            luma(light.muted_button_bg) > luma(light.button_bg),
+            "the inactive repo's button must read weaker than the active one"
+        );
+    }
+
+    #[test]
+    fn light_selection_names_its_own_foreground() {
+        // The dark themes let the terminal's foreground show through the
+        // selection; on a light background that leaves dark-on-dark, so the
+        // light palette must state a foreground of its own.
+        let focused = selection_style_for(ColorTheme::Light, true);
+        assert_eq!(focused.bg, Some(LIGHT_PALETTE.selection_bg));
+        assert_eq!(focused.fg, Some(LIGHT_PALETTE.selection_fg));
+        assert!(focused.add_modifier.contains(Modifier::BOLD));
+        let unfocused = selection_style_for(ColorTheme::Light, false);
+        assert_eq!(unfocused.fg, Some(LIGHT_PALETTE.selection_unfocused_fg));
+        // `Color::Reset` is "leave it alone", never an emitted foreground.
+        assert_eq!(selection_style_for(ColorTheme::VsCode, true).fg, None);
+        assert_eq!(hover_style_for(ColorTheme::Light).fg, None);
+    }
+
+    #[test]
+    fn icon_colors_are_dimmed_only_for_the_light_theme() {
+        // The JS yellow from `icons::material` — unreadable on white as-is.
+        let js = (0xf1, 0xe0, 0x5a);
+        let dimmed = darken_for_light(js);
+        assert!(luma(Color::Rgb(dimmed.0, dimmed.1, dimmed.2)) <= 0.43);
+        // Hue survives: the channel order is unchanged.
+        assert!(dimmed.0 > dimmed.2 && dimmed.1 > dimmed.2);
+        // A color that is already dark enough passes through untouched.
+        let ruby = (0x70, 0x15, 0x16);
+        assert_eq!(darken_for_light(ruby), ruby);
+        // `set_color_theme` is process-global and tests run in parallel —
+        // drive the theme-taking form instead of mutating it here.
+        assert_eq!(
+            icon_style_for(ColorTheme::VsCode, Some(js)).fg,
+            Some(Color::Rgb(js.0, js.1, js.2))
+        );
+        assert_eq!(
+            icon_style_for(ColorTheme::Light, Some(js)).fg,
+            Some(Color::Rgb(dimmed.0, dimmed.1, dimmed.2))
+        );
+        assert_eq!(icon_style_for(ColorTheme::Light, None).fg, None);
+    }
 
     #[test]
     fn terminal_palette_uses_terminal_mapped_ansi_colors() {

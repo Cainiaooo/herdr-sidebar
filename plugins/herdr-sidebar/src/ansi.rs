@@ -110,7 +110,7 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
 }
 
 fn basic_color(n: u16, bright: bool) -> Color {
-    match (n, bright) {
+    let color = match (n, bright) {
         (0, false) => Color::Black,
         (1, false) => Color::Red,
         (2, false) => Color::Green,
@@ -127,6 +127,13 @@ fn basic_color(n: u16, bright: bool) -> Color {
         (5, true) => Color::LightMagenta,
         (6, true) => Color::LightCyan,
         _ => Color::White,
+    };
+    // On a light terminal background the profile's white / light grey are
+    // invisible; hand those back to the default foreground instead.
+    if crate::ui::is_light() && matches!(color, Color::White | Color::Gray) {
+        Color::Reset
+    } else {
+        color
     }
 }
 

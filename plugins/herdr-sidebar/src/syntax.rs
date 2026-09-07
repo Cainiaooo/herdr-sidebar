@@ -20,24 +20,38 @@ use syntect::util::LinesWithEndings;
 const MAX_HIGHLIGHT_LINE_LEN: usize = 2000;
 
 /// Grammar + theme assets, loaded once (the bundled dumps take a few ms).
-fn assets() -> &'static (SyntaxSet, Theme) {
-    static ASSETS: OnceLock<(SyntaxSet, Theme)> = OnceLock::new();
+/// BOTH themes are built up front: switching the color theme must not stall a
+/// render, and the dumps are small.
+fn assets() -> &'static (SyntaxSet, Theme, Theme) {
+    static ASSETS: OnceLock<(SyntaxSet, Theme, Theme)> = OnceLock::new();
     ASSETS.get_or_init(|| {
         let syntaxes = two_face::syntax::extra_newlines();
         let mut themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .remove("base16-ocean.dark")
-            .or_else(|| themes.themes.pop_first().map(|(_, t)| t))
-            .unwrap_or_default();
-        (syntaxes, theme)
+        let mut pick = |name: &str| {
+            themes
+                .themes
+                .remove(name)
+                .or_else(|| themes.themes.pop_first().map(|(_, t)| t))
+                .unwrap_or_default()
+        };
+        let dark = pick("base16-ocean.dark");
+        let light = pick("InspiredGitHub");
+        (syntaxes, dark, light)
     })
+}
+
+/// The grammar set plus the theme that suits the active color theme. syntect
+/// colors foregrounds only, so a dark grammar theme on a light terminal is
+/// exactly the washed-out case the light palette exists to fix.
+fn syntaxes_and_theme() -> (&'static SyntaxSet, &'static Theme) {
+    let (syntaxes, dark, light) = assets();
+    (syntaxes, if crate::ui::is_light() { light } else { dark })
 }
 
 /// Highlight `text` for a file called `name`, up to `max` lines. `None` when
 /// no grammar matches (caller falls back to plain lines).
 pub fn highlight(name: &str, text: &str, max: usize) -> Option<Vec<Line<'static>>> {
-    let (syntaxes, theme) = assets();
+    let (syntaxes, theme) = syntaxes_and_theme();
     let ext = name.rsplit('.').next().unwrap_or("");
     let syntax = syntaxes
         .find_syntax_by_extension(ext)
@@ -86,7 +100,7 @@ pub struct LineHighlighter {
 
 impl LineHighlighter {
     pub fn new(name: &str) -> Self {
-        let (syntaxes, theme) = assets();
+        let (syntaxes, theme) = syntaxes_and_theme();
         let ext = name.rsplit('.').next().unwrap_or("");
         let syntax = syntaxes
             .find_syntax_by_extension(ext)
@@ -102,7 +116,7 @@ impl LineHighlighter {
         if text.len() > MAX_HIGHLIGHT_LINE_LEN {
             return vec![Span::raw(text.to_string())];
         }
-        let (syntaxes, _) = assets();
+        let (syntaxes, _) = syntaxes_and_theme();
         let with_nl = format!("{text}\n");
         match hl.highlight_line(&with_nl, syntaxes) {
             Ok(regions) => regions

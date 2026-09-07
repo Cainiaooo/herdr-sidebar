@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
@@ -817,7 +817,7 @@ impl Editor {
                             } < end
                     });
                     let style = if selected {
-                        Style::default().bg(Color::DarkGray)
+                        Style::default().bg(crate::ui::palette().text_selection_bg)
                     } else {
                         Style::default()
                     };
