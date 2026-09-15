@@ -144,7 +144,7 @@ token has `workflow`, follow upstream workflow files (currently
 `actions/upload-artifact@v7`).
 
 If a merge looks wrong, compare against the last known-good upstream base
-recorded in `CHANGELOG.md`.
+recorded in `CHANGELOG.md` (currently v0.13.0 / `1a5d37e`).
 
 ## Reviewer map
 

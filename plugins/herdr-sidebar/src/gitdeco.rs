@@ -100,7 +100,10 @@ impl Decorations {
         let path = abs(root, rel);
         // A later, equally loud status REPLACES the earlier one — which is
         // how the working-tree side wins over the staged side.
-        let quieter = self.files.get(&path).is_some_and(|e| rank(*e) > rank(letter));
+        let quieter = self
+            .files
+            .get(&path)
+            .is_some_and(|e| rank(*e) > rank(letter));
         if !quieter {
             self.files.insert(path.clone(), letter);
         }
@@ -197,23 +200,41 @@ mod tests {
         assert_eq!(at(&deco, "src/api", true), Some('M'), "immediate parent");
         assert_eq!(at(&deco, "src", true), Some('M'), "and every ancestor");
         assert_eq!(at(&deco, "", true), Some('M'), "up to the repo root");
-        assert_eq!(at(&deco, "docs", true), None, "untouched siblings stay clean");
+        assert_eq!(
+            at(&deco, "docs", true),
+            None,
+            "untouched siblings stay clean"
+        );
     }
 
     #[test]
     fn directory_aggregate_takes_the_loudest_descendant() {
-        let deco =
-            Decorations::build(&[repo("/ws", "## main\0?? src/scratch.txt\0 M src/app.rs\0", &[])]);
+        let deco = Decorations::build(&[repo(
+            "/ws",
+            "## main\0?? src/scratch.txt\0 M src/app.rs\0",
+            &[],
+        )]);
         assert_eq!(
             at(&deco, "src", true),
             Some('M'),
             "a tracked change outranks an untracked sibling"
         );
-        let deco =
-            Decorations::build(&[repo("/ws", "## main\0 M src/app.rs\0UU src/merge.rs\0", &[])]);
-        assert_eq!(at(&deco, "src", true), Some('!'), "a conflict outranks everything");
+        let deco = Decorations::build(&[repo(
+            "/ws",
+            "## main\0 M src/app.rs\0UU src/merge.rs\0",
+            &[],
+        )]);
+        assert_eq!(
+            at(&deco, "src", true),
+            Some('!'),
+            "a conflict outranks everything"
+        );
         let deco = Decorations::build(&[repo("/ws", "## main\0?? src/scratch.txt\0", &[])]);
-        assert_eq!(at(&deco, "src", true), Some('U'), "untracked-only stays green");
+        assert_eq!(
+            at(&deco, "src", true),
+            Some('U'),
+            "untracked-only stays green"
+        );
     }
 
     #[test]
@@ -230,7 +251,11 @@ mod tests {
         assert_eq!(at(&deco, "target/debug/x.exe", false), Some('I'));
         assert_eq!(at(&deco, "notes.log", false), Some('I'));
         assert_eq!(at(&deco, "src", true), None);
-        assert_eq!(at(&deco, "", true), None, "the root is not dirty from ignores");
+        assert_eq!(
+            at(&deco, "", true),
+            None,
+            "the root is not dirty from ignores"
+        );
     }
 
     #[test]

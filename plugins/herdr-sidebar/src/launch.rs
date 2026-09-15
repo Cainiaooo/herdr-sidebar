@@ -1,6 +1,6 @@
-//! Launcher helpers behind `scripts/open-explorer.{sh,ps1}` — kept in Rust so the
-//! logic is unit-tested and so ids/paths extracted from herdr's JSON are validated
-//! before they reach an argv (option-injection guard). Three stdin→stdout modes:
+//! Pure decision/layout helpers used by the native launcher and exposed through
+//! stdin→stdout diagnostic modes. Keeping the parsing here makes the behavior
+//! unit-testable and validates ids/paths before they reach an API request.
 //!
 //! - `--launch-decision`: `herdr pane list` JSON → `OPEN` | `FOCUS <pane_id>` |
 //!   `CLOSE <pane_id>`, scoped to the focused pane's tab (toggle behavior).
@@ -20,6 +20,12 @@ pub const PANE_LABEL: &str = "Explorer";
 /// Source id for `pane.report_metadata`; its token marks a pane as the
 /// Explorer independently of the (cosmetic, clearable) label.
 pub const METADATA_SOURCE: &str = "herdr-sidebar-explorer";
+
+/// Present only while a TUI is starting. Windows launchers stamp it after a
+/// raw split; directly spawned Unix TUIs stamp it at process startup. The
+/// first full identity report clears it, so a pane carrying this token cannot
+/// hold unsaved in-memory state yet.
+pub const STARTING_TOKEN: &str = "herdr-sidebar-starting";
 
 const MIN_SIDEBAR_SHARE: f64 = 0.15;
 const MAX_SIDEBAR_SHARE: f64 = 0.5;
@@ -113,7 +119,10 @@ impl CwdFollower {
         }
 
         let prior_selected = self.selected.clone();
-        let prior_cwd = prior_selected.as_ref().and_then(|id| self.seen.get(id)).cloned();
+        let prior_cwd = prior_selected
+            .as_ref()
+            .and_then(|id| self.seen.get(id))
+            .cloned();
         let picked = pick_sibling(
             &siblings.iter().collect::<Vec<_>>(),
             self.selected.as_deref(),
@@ -127,23 +136,25 @@ impl CwdFollower {
     }
 }
 
-fn pick_sibling<'a>(
-    siblings: &[&'a SiblingCwd],
-    selected: Option<&str>,
-) -> Option<&'a SiblingCwd> {
+fn pick_sibling<'a>(siblings: &[&'a SiblingCwd], selected: Option<&str>) -> Option<&'a SiblingCwd> {
     siblings
         .iter()
         .copied()
         .find(|s| s.focused)
-        .or_else(|| siblings.iter().copied().find(|s| Some(s.pane_id.as_str()) == selected))
+        .or_else(|| {
+            siblings
+                .iter()
+                .copied()
+                .find(|s| Some(s.pane_id.as_str()) == selected)
+        })
         .or_else(|| siblings.first().copied())
 }
 
 impl Pane {
     /// An Explorer is recognized by its metadata token (reported by the TUI at
     /// startup — survives the label being cleared while collapsed) or by the
-    /// "Explorer" label (present from the moment the launcher renames the
-    /// fresh pane, before the TUI has reported its token).
+    /// "Explorer" label (retained for restored panes whose metadata does not
+    /// survive a Herdr server restart).
     fn is_explorer(&self) -> bool {
         self.tokens.contains_key(METADATA_SOURCE)
             || self.label.as_deref() == Some(PANE_LABEL)
@@ -153,10 +164,9 @@ impl Pane {
     /// One of OUR labels with NO heartbeat token is a corpse. The main way
     /// this happens: herdr resumes a restarted server's panes with their
     /// labels and scrollback, but the process inside is a fresh shell and
-    /// metadata tokens do not survive. (A launcher does rename a pane
-    /// moments before the TUI stamps its first token, so this can race a
-    /// fresh spawn for ~a second — REPLACE just respawns, and the next pass
-    /// sees a live token, so the race self-heals.)
+    /// metadata tokens do not survive. Native launches hold the shared lock
+    /// until identity is stamped, so queued hooks never mistake a fresh pane
+    /// for one of these restored corpses.
     fn our_label_without_token(&self) -> bool {
         matches!(self.label.as_deref(), Some("Sidebar" | "Explorer"))
             && !self.tokens.contains_key(METADATA_SOURCE)
@@ -225,12 +235,10 @@ pub const HEARTBEAT_STALE_SECS: u64 = 20;
 /// True when `key` is present but its heartbeat timestamp is missing,
 /// unparsable, or older than [`HEARTBEAT_STALE_SECS`]. Absent key = false
 /// (a fresh pane the launcher labeled but whose TUI hasn't reported yet).
-fn token_stale(
-    tokens: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    now: u64,
-) -> bool {
-    let Some(value) = tokens.get(key) else { return false };
+fn token_stale(tokens: &serde_json::Map<String, serde_json::Value>, key: &str, now: u64) -> bool {
+    let Some(value) = tokens.get(key) else {
+        return false;
+    };
     let ts = value
         .as_u64()
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
@@ -340,10 +348,7 @@ pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     }
 }
 
-/// Whether `pane_id` carries any of our identity tokens yet — the spawn
-/// wait polls this so hook invocations queued behind the lock always see a
-/// LIVE pane (without it, the label-without-token corpse rule replaces the
-/// fresh spawn before its TUI boots: an infinite replace loop, seen live).
+/// Whether `pane_id` carries any of our identity tokens.
 pub fn pane_has_token(pane_list_json: &str, pane_id: &str) -> bool {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return false;
@@ -355,6 +360,19 @@ pub fn pane_has_token(pane_list_json: &str, pane_id: &str) -> bool {
         .any(|p| {
             p.tokens.contains_key(METADATA_SOURCE) || p.tokens.contains_key(SC_METADATA_SOURCE)
         })
+}
+
+/// Whether `pane_id` has started but not yet reached the TUI event loop. The
+/// first full identity report clears this marker.
+pub fn pane_is_starting(pane_list_json: &str, pane_id: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return false;
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(pane_id))
+        .is_some_and(|p| p.tokens.contains_key(STARTING_TOKEN))
 }
 
 /// `<pane_id>\t<cwd>` of the focused pane, or empty on any failure. The cwd
@@ -401,7 +419,10 @@ fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
         return Vec::new();
     };
     let panes = &msg.result.panes;
-    let Some(me) = panes.iter().find(|p| p.pane_id.as_deref() == Some(my_pane_id)) else {
+    let Some(me) = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
+    else {
         return Vec::new();
     };
     let mut siblings = panes
@@ -447,9 +468,7 @@ pub fn open_plan(layout_json: &str, dock_right: bool, target_cols: u16) -> Strin
         // The configured edge wins; among a stacked edge column, topmost wins.
         let better = match best {
             None => true,
-            Some((_, b)) if dock_right => {
-                (rect.x + rect.width, -rect.y) > (b.x + b.width, -b.y)
-            }
+            Some((_, b)) if dock_right => (rect.x + rect.width, -rect.y) > (b.x + b.width, -b.y),
             Some((_, b)) => (rect.x, rect.y) < (b.x, b.y),
         };
         if better {
@@ -461,7 +480,11 @@ pub fn open_plan(layout_json: &str, dock_right: bool, target_cols: u16) -> Strin
     };
     let sidebar_share =
         (f64::from(target_cols) / rect.width as f64).clamp(MIN_SIDEBAR_SHARE, MAX_SIDEBAR_SHARE);
-    let ratio = if dock_right { 1.0 - sidebar_share } else { sidebar_share };
+    let ratio = if dock_right {
+        1.0 - sidebar_share
+    } else {
+        sidebar_share
+    };
     format!("{id}\t{ratio:.6}\t{}", !dock_right)
 }
 
@@ -593,6 +616,25 @@ pub fn workspace_id_from_scope(scope: &str, pane_list_json: &str) -> String {
     if is_flag_safe(scope) { scope.to_string() } else { String::new() }
 }
 
+pub fn event_scope_with_tab_context(
+    event_json: &str,
+    pane_list_json: &str,
+    context_tab: &str,
+) -> String {
+    let scope = event_scope_in(event_json, pane_list_json);
+    let context_matches = is_flag_safe(context_tab)
+        && context_tab.contains(':')
+        && (scope.is_empty()
+            || scope == context_tab
+            || (!scope.contains(':') && context_tab.starts_with(&format!("{scope}:"))));
+    if context_matches {
+        context_tab.to_string()
+    } else {
+        scope
+    }
+}
+
+
 /// The pane whose cwd a sidebar docked into `scope` should be rooted from:
 /// the focused pane WITHIN that scope, else any pane in it (a brand-new space
 /// may not have a focused pane yet). An empty scope keeps the old global
@@ -629,7 +671,7 @@ pub fn focused_pane_in(pane_list_json: &str, scope: &str) -> String {
 
 /// Which event invoked the ensure hook, from `HERDR_PLUGIN_EVENT_JSON`.
 ///
-/// All five hooks run the SAME script, so the payload is the only way to
+/// All launcher hooks run the same native implementation, so the payload is the only way to
 /// treat space creation differently from an ordinary focus. The envelope
 /// `EventEnvelope` currently serializes the discriminator as lower_snake in
 /// `event`, while manifest hook names use dotted form. Both are accepted, and
@@ -732,6 +774,49 @@ pub fn tab_of(pane_list_json: &str, pane_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Any pane living in `tab_id` ("" when the tab is empty or unknown). The
+/// preview flow needs one because herdr 0.9 moves the VIEWING client only on
+/// `pane.focus`; `tab.focus` updates the session-wide record and nothing else.
+pub fn pane_in_tab(pane_list_json: &str, tab_id: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.tab_id.as_deref() == Some(tab_id))
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
+/// The pane id the SERVER currently records as focused ("" when none) —
+/// unlike `focused_pane`, no cwd, no flag-safety filter.
+pub fn server_focused_pane_id(pane_list_json: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.focused)
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
+/// Any pane NOT in `tab_id` ("" when there is none) — a stepping stone when a
+/// focus transition must be forced.
+pub fn pane_outside_tab(pane_list_json: &str, tab_id: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return String::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.tab_id.as_deref() != Some(tab_id))
+        .and_then(|p| p.pane_id.clone())
+        .unwrap_or_default()
+}
+
 /// The workspace a pane belongs to, empty when the pane is unknown. Preview
 /// routing is scoped by it so one project's ephemeral tab is never reused
 /// from another.
@@ -784,6 +869,64 @@ pub fn split_pane_id(response_json: &str) -> Option<String> {
         .filter(|id| is_flag_safe(id))
 }
 
+/// `(tab_id, root_pane_id)` from a `tab.create` response
+/// (`{"result":{"tab":{"tab_id":..},"root_pane":{"pane_id":..}}}`), both
+/// validated flag-safe. The root pane is the tab's one shell pane — the
+/// preview flow drives it as the viewer instead of splitting a second one.
+pub fn created_tab_root_pane(response_json: &str) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(Deserialize)]
+    struct Res {
+        tab: Option<Tab>,
+        root_pane: Option<Pane>,
+    }
+    #[derive(Deserialize)]
+    struct Tab {
+        tab_id: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+    }
+    let res = serde_json::from_str::<Msg>(strip_bom(response_json))
+        .ok()?
+        .result;
+    let tab_id = res.tab?.tab_id.filter(|id| is_flag_safe(id))?;
+    let pane_id = res.root_pane?.pane_id.filter(|id| is_flag_safe(id))?;
+    Some((tab_id, pane_id))
+}
+
+/// The created pane id from a `plugin.pane.open` response. Direct plugin-pane
+/// spawning starts the manifest argv without showing an intermediary shell.
+pub fn plugin_pane_id(response_json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(Deserialize)]
+    struct Res {
+        plugin_pane: PluginPane,
+    }
+    #[derive(Deserialize)]
+    struct PluginPane {
+        pane: Info,
+    }
+    #[derive(Deserialize)]
+    struct Info {
+        pane_id: Option<String>,
+    }
+    serde_json::from_str::<Msg>(strip_bom(response_json))
+        .ok()?
+        .result
+        .plugin_pane
+        .pane
+        .pane_id
+        .filter(|id| is_flag_safe(id))
+}
+
 /// One step of the full-height repair: `below` (a pane under the sidebar,
 /// truncating its column) should be re-parented as a down-split of `beside`
 /// (the pane toward the tab interior) in `tab`.
@@ -799,11 +942,7 @@ pub struct RepairStep {
 /// same-tab moves) grows the sidebar to full height. `None` when already full
 /// height or the layout doesn't match. Called in a loop: each step removes one
 /// pane from under the sidebar.
-pub fn repair_step(
-    layout_json: &str,
-    pane_id: &str,
-    dock_right: bool,
-) -> Option<RepairStep> {
+pub fn repair_step(layout_json: &str, pane_id: &str, dock_right: bool) -> Option<RepairStep> {
     let msg = serde_json::from_str::<LayoutMsg>(strip_bom(layout_json)).ok()?;
     let layout = &msg.result.layout;
     let area = layout.area.as_ref()?;
@@ -826,15 +965,17 @@ pub fn repair_step(
             .find(|(id, rect)| is_flag_safe(id) && pred(rect))
             .map(|(id, _)| id.to_string())
     };
-    let below = find(&|r: &Rect| {
-        r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width
-    })?;
+    let below = find(&|r: &Rect| r.y == me.y + me.height && r.x <= me.x && me.x < r.x + r.width)?;
     let beside = if dock_right {
         find(&|r: &Rect| r.x + r.width == me.x && r.y == me.y)?
     } else {
         find(&|r: &Rect| r.x == me.x + me.width && r.y == me.y)?
     };
-    Some(RepairStep { below, beside, tab: tab.to_string() })
+    Some(RepairStep {
+        below,
+        beside,
+        tab: tab.to_string(),
+    })
 }
 
 /// One `herdr pane resize` invocation: which way to move our interior edge and by
@@ -906,7 +1047,11 @@ fn resize_plan_inner(
         .find(|p| p.pane_id.as_deref() == Some(pane_id))?
         .rect
         .as_ref()?;
-    let divider_x = if dock_right { pane_rect.x } else { pane_rect.x + pane_rect.width };
+    let divider_x = if dock_right {
+        pane_rect.x
+    } else {
+        pane_rect.x + pane_rect.width
+    };
     let split = layout
         .splits
         .iter()
@@ -1048,7 +1193,10 @@ mod tests {
         assert_eq!(event_scope(nested), "wH");
         assert_eq!(event_scope("garbage"), "");
         // Shell-unsafe ids are dropped, same as the event kind.
-        assert_eq!(event_scope(r#"{"data":{"workspace_id":"a b; rm -rf /"}}"#), "");
+        assert_eq!(
+            event_scope(r#"{"data":{"workspace_id":"a b; rm -rf /"}}"#),
+            ""
+        );
     }
 
     #[test]
@@ -1080,13 +1228,29 @@ mod tests {
         assert_eq!(event_scope(event), "w4");
     }
 
-    /// The hook fires for five different events into ONE script, so the only
+    #[test]
+    fn workspace_focus_uses_its_active_tab_context() {
+        let event = r#"{"event":"workspace.focused","data":{"workspace_id":"w4"}}"#;
+        let panes = pane_list(
+            r#"{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4"},
+               {"pane_id":"w4:p9","tab_id":"w4:t2","workspace_id":"w4","focused":true,"foreground_cwd":"/repo/two"}"#,
+        );
+        let scope = event_scope_with_tab_context(event, &panes, "w4:t2");
+        assert_eq!(scope, "w4:t2");
+        assert_eq!(focused_pane_in(&panes, &scope), "w4:p9\t/repo/two");
+        assert_eq!(event_scope_with_tab_context(event, &panes, "w9:t1"), "w4");
+    }
+
+    /// The launcher handles several event kinds through one implementation, so the only
     /// way to treat space creation specially is the payload. The envelope
     /// shape isn't documented, so the discriminator is looked for at the top
     /// level and under the usual wrappers.
     #[test]
     fn event_kind_is_found_whatever_the_envelope() {
-        assert_eq!(event_kind(r#"{"type":"workspace_created"}"#), "workspace_created");
+        assert_eq!(
+            event_kind(r#"{"type":"workspace_created"}"#),
+            "workspace_created"
+        );
         assert_eq!(
             event_kind(r#"{"data":{"type":"workspace_created"}}"#),
             "workspace_created"
@@ -1142,7 +1306,10 @@ mod tests {
             r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}},
                {"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/stale/spawn","foreground_cwd":"/live/project"}"#,
         );
-        assert_eq!(follower.next_cwd(&live, "w1:p3").as_deref(), Some("/live/project"));
+        assert_eq!(
+            follower.next_cwd(&live, "w1:p3").as_deref(),
+            Some("/live/project")
+        );
 
         follower.reset();
         let stale_only = pane_list(
@@ -1161,7 +1328,10 @@ mod tests {
                {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"}"#,
         );
         // No focused sibling: lexical pane id is the stable fallback.
-        assert_eq!(follower.next_cwd(&unordered, "w1:p3").as_deref(), Some("/one"));
+        assert_eq!(
+            follower.next_cwd(&unordered, "w1:p3").as_deref(),
+            Some("/one")
+        );
         assert_eq!(follower.next_cwd(&unordered, "w1:p3"), None);
 
         let focused = pane_list(
@@ -1169,7 +1339,10 @@ mod tests {
                {"pane_id":"w1:p9","tab_id":"w1:t1","foreground_cwd":"/nine","focused":true},
                {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"}"#,
         );
-        assert_eq!(follower.next_cwd(&focused, "w1:p3").as_deref(), Some("/nine"));
+        assert_eq!(
+            follower.next_cwd(&focused, "w1:p3").as_deref(),
+            Some("/nine")
+        );
     }
 
     #[test]
@@ -1180,7 +1353,10 @@ mod tests {
                {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
                {"pane_id":"w1:p2","tab_id":"w1:t1","foreground_cwd":"/two"}"#,
         );
-        assert_eq!(follower.next_cwd(&initial, "w1:p3").as_deref(), Some("/one"));
+        assert_eq!(
+            follower.next_cwd(&initial, "w1:p3").as_deref(),
+            Some("/one")
+        );
         follower.mark_manual_folder();
 
         // Focus alone, pane-list reordering, and a newly-created pane do not
@@ -1216,14 +1392,19 @@ mod tests {
         assert_eq!(CwdFollower::default().next_cwd(&json, "w1:p3"), None);
     }
 
-    const FOCUSED: &str = r#"{"pane_id":"w1:p1","focused":true,"tab_id":"w1:t1","cwd":"C:\\work\\my repo"}"#;
+    const FOCUSED: &str =
+        r#"{"pane_id":"w1:p1","focused":true,"tab_id":"w1:t1","cwd":"C:\\work\\my repo"}"#;
 
     #[test]
     fn decision_opens_when_no_explorer_in_tab() {
         let json = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"w1:p9","label":"Explorer","tab_id":"w1:t2"}}"#
         ));
-        assert_eq!(launch_decision(&json, 100), "OPEN", "other-tab Explorer is ignored");
+        assert_eq!(
+            launch_decision(&json, 100),
+            "OPEN",
+            "other-tab Explorer is ignored"
+        );
     }
 
     #[test]
@@ -1255,14 +1436,27 @@ mod tests {
     #[test]
     fn pane_token_probe_distinguishes_starting_and_live_sidebars() {
         let starting = pane_list(
-            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","tokens":{}}"#,
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","focused":true,"tokens":{"herdr-sidebar-explorer":"100","herdr-sidebar-starting":"1"}}"#,
         );
         let live = pane_list(
             r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Explorer","tokens":{"herdr-sidebar-explorer":"100"}}"#,
         );
-        assert!(!pane_has_token(&starting, "w1:p1"));
+        // Synchronous pre-stamping makes the pane live to re-entrant hooks,
+        // while retaining enough state for an immediate second toggle to
+        // close it directly before its event loop starts.
+        assert_eq!(launch_decision(&starting, 100), "CLOSE w1:p1");
+        assert!(pane_has_token(&starting, "w1:p1"));
         assert!(pane_has_token(&live, "w1:p1"));
         assert!(!pane_has_token(&live, "w1:p2"));
+        assert!(pane_is_starting(&starting, "w1:p1"));
+        assert!(!pane_is_starting(&live, "w1:p1"));
+        assert!(!pane_is_starting(&starting, "w1:p2"));
+
+        let source_control = pane_list(
+            r#"{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Source Control","focused":true,"tokens":{"herdr-sidebar-git":"100","herdr-sidebar-starting":"1"}}"#,
+        );
+        assert_eq!(launch_decision_git(&source_control, 100), "CLOSE w1:p1");
+        assert!(pane_is_starting(&source_control, "w1:p1"));
     }
 
     #[test]
@@ -1283,7 +1477,11 @@ mod tests {
             let corpse = pane_list(&format!(
                 r#"{FOCUSED},{{"pane_id":"w1:p2","label":"{label}","tab_id":"w1:t1"}}"#
             ));
-            assert_eq!(launch_decision(&corpse, 100), "REPLACE w1:p2", "{label} corpse");
+            assert_eq!(
+                launch_decision(&corpse, 100),
+                "REPLACE w1:p2",
+                "{label} corpse"
+            );
         }
         let sc_corpse = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"w1:p3","label":"Source Control","tab_id":"w1:t1"}}"#
@@ -1303,7 +1501,10 @@ mod tests {
     #[test]
     fn decision_degrades_to_open_on_garbage_or_unsafe_ids() {
         assert_eq!(launch_decision("not json", 100), "OPEN");
-        assert_eq!(launch_decision(&pane_list(r#"{"pane_id":"w1:p1"}"#), 100), "OPEN");
+        assert_eq!(
+            launch_decision(&pane_list(r#"{"pane_id":"w1:p1"}"#), 100),
+            "OPEN"
+        );
         let json = pane_list(&format!(
             r#"{FOCUSED},{{"pane_id":"--evil","label":"Explorer","tab_id":"w1:t1"}}"#
         ));
@@ -1393,12 +1594,22 @@ mod tests {
 
     #[test]
     fn split_pane_id_extracts_and_validates() {
-        let json = r#"{"id":"x","result":{"pane":{"pane_id":"w3:p5","cwd":"C:x"},"type":"pane_info"}}"#;
+        let json =
+            r#"{"id":"x","result":{"pane":{"pane_id":"w3:p5","cwd":"C:x"},"type":"pane_info"}}"#;
         assert_eq!(split_pane_id(json), Some("w3:p5".to_string()));
         let evil = r#"{"id":"x","result":{"pane":{"pane_id":"--evil"},"type":"pane_info"}}"#;
         assert_eq!(split_pane_id(evil), None);
         assert_eq!(split_pane_id("not json"), None);
         assert_eq!(split_pane_id(r#"{"id":"x","result":{"type":"ok"}}"#), None);
+    }
+
+    #[test]
+    fn plugin_pane_id_extracts_and_validates() {
+        let json = r#"{"result":{"plugin_pane":{"plugin_id":"herdr-sidebar","entrypoint":"sidebar","pane":{"pane_id":"w3:p5"}}}}"#;
+        assert_eq!(plugin_pane_id(json), Some("w3:p5".to_string()));
+        let evil = r#"{"result":{"plugin_pane":{"pane":{"pane_id":"--evil"}}}}"#;
+        assert_eq!(plugin_pane_id(evil), None);
+        assert_eq!(plugin_pane_id("not json"), None);
     }
 
     fn layout_with_splits(panes: &str, splits: &str) -> String {
@@ -1423,7 +1634,10 @@ mod tests {
                {"pane_id":"p4","rect":{"x":90,"y":0,"width":90,"height":50}}"#,
         );
         let step = repair_step(&json, "e", false).unwrap();
-        assert_eq!((step.below.as_str(), step.beside.as_str(), step.tab.as_str()), ("p7", "p1", "w1:t1"));
+        assert_eq!(
+            (step.below.as_str(), step.beside.as_str(), step.tab.as_str()),
+            ("p7", "p1", "w1:t1")
+        );
     }
 
     #[test]
@@ -1435,7 +1649,10 @@ mod tests {
                {"pane_id":"p7","rect":{"x":90,"y":25,"width":90,"height":25}}"#,
         );
         let step = repair_step(&json, "e", true).unwrap();
-        assert_eq!((step.below.as_str(), step.beside.as_str(), step.tab.as_str()), ("p7", "p1", "w1:t1"));
+        assert_eq!(
+            (step.below.as_str(), step.beside.as_str(), step.tab.as_str()),
+            ("p7", "p1", "w1:t1")
+        );
     }
 
     #[test]
@@ -1519,7 +1736,10 @@ mod tests {
     fn resize_plan_returns_none_when_unresizable_or_at_target() {
         assert!(resize_plan("not json", "e", 30, 4, false).is_none());
         // No split with a divider at the pane's edge (e.g. the only pane).
-        let solo = layout_with_splits(r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":100,"height":50}}"#, "");
+        let solo = layout_with_splits(
+            r#"{"pane_id":"e","rect":{"x":0,"y":0,"width":100,"height":50}}"#,
+            "",
+        );
         assert!(resize_plan(&solo, "e", 98, 30, false).is_none());
         // Already at the target.
         let json = layout_with_splits(

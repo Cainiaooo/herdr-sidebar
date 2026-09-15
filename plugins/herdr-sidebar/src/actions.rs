@@ -76,10 +76,7 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
 /// separators or drive colons (a name, not a path).
 pub fn validate_name(input: &str) -> Option<&str> {
     let name = input.trim();
-    (!name.is_empty()
-        && !name.contains(['/', '\\', ':'])
-        && name != "."
-        && name != "..")
+    (!name.is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != "..")
         .then_some(name)
 }
 
@@ -129,7 +126,11 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
     #[cfg(not(windows))]
-    let candidates: &[&[&str]] = &[&["pbcopy"], &["wl-copy"], &["xclip", "-selection", "clipboard"]];
+    let candidates: &[&[&str]] = &[
+        &["pbcopy"],
+        &["wl-copy"],
+        &["xclip", "-selection", "clipboard"],
+    ];
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
@@ -162,7 +163,10 @@ fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("{} exited with {status}", argv[0])))
+        Err(io::Error::other(format!(
+            "{} exited with {status}",
+            argv[0]
+        )))
     }
 }
 
@@ -188,16 +192,16 @@ pub fn paste_from_clipboard() -> io::Result<String> {
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
     for argv in candidates {
-        match std::process::Command::new(argv[0]).args(&argv[1..]).output() {
+        match std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+        {
             Ok(output) if output.status.success() => {
                 return String::from_utf8(output.stdout)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
             }
             Ok(output) => {
-                last_err = io::Error::other(format!(
-                    "{} exited with {}",
-                    argv[0], output.status
-                ));
+                last_err = io::Error::other(format!("{} exited with {}", argv[0], output.status));
             }
             Err(err) => last_err = err,
         }
@@ -205,22 +209,33 @@ pub fn paste_from_clipboard() -> io::Result<String> {
     Err(last_err)
 }
 
-/// Open the platform file manager with the path selected (best-effort).
-pub fn reveal(path: &Path) {
+/// Open a directory itself, or open its parent with a file selected
+/// (best-effort). Revealing a folder in its parent made the Explorer action
+/// look like it had ignored the clicked tree row.
+pub fn reveal(path: &Path, directory: bool) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn();
+        let mut command = std::process::Command::new("explorer");
+        if directory {
+            command.arg(path);
+        } else {
+            command.arg(format!("/select,{}", path.display()));
+        }
+        let _ = command.spawn();
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+        let mut command = std::process::Command::new("open");
+        if !directory {
+            command.arg("-R");
+        }
+        let _ = command.arg(path).spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(parent) = path.parent() {
-            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        let target = if directory { Some(path) } else { path.parent() };
+        if let Some(target) = target {
+            let _ = std::process::Command::new("xdg-open").arg(target).spawn();
         }
     }
 }
@@ -251,6 +266,314 @@ pub fn open_external(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
+const EDITOR_COMMAND_ENV: &str = "HERDR_SIDEBAR_EDITOR";
+const EDITOR_FILE_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE";
+const EDITOR_FILE_TOKEN_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE_TOKEN";
+const EDITOR_METADATA_SOURCE: &str = "herdr-sidebar-editor";
+const EDITOR_PATH_TOKEN: &str = "hs-editor-path";
+const EDITOR_HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub fn configured_editor() -> Option<String> {
+    crate::state::load_editor_command().or_else(|| {
+        [EDITOR_COMMAND_ENV, "VISUAL", "EDITOR"]
+            .into_iter()
+            .find_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+    })
+}
+
+fn editor_argv(command: &str, file: &Path) -> io::Result<Vec<String>> {
+    let mut argv = split_editor_command(command)?;
+    if argv.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "editor command is empty",
+        ));
+    }
+    let file = file.display().to_string();
+    let mut replaced = false;
+    for arg in &mut argv {
+        if arg.contains("{file}") {
+            *arg = arg.replace("{file}", &file);
+            replaced = true;
+        }
+    }
+    if !replaced {
+        argv.push(file);
+    }
+    Ok(argv)
+}
+
+fn split_editor_command(command: &str) -> io::Result<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some('\'') => current.push(ch),
+            Some('"') if ch == '\\' => {
+                if matches!(chars.peek(), Some('"' | '\\')) {
+                    current.push(chars.next().unwrap());
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some(_) => current.push(ch),
+            None if matches!(ch, '\'' | '"') => {
+                quote = Some(ch);
+                started = true;
+            }
+            None if ch.is_whitespace() => {
+                if started {
+                    argv.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            None if ch == '\\' => {
+                if chars
+                    .peek()
+                    .is_some_and(|next| next.is_whitespace() || matches!(next, '\'' | '"' | '\\'))
+                {
+                    current.push(chars.next().unwrap());
+                } else {
+                    current.push(ch);
+                }
+                started = true;
+            }
+            None => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid editor command",
+        ));
+    }
+    if started {
+        argv.push(current);
+    }
+    Ok(argv)
+}
+
+pub fn run_configured_editor() -> io::Result<()> {
+    let command = std::env::var(EDITOR_COMMAND_ENV)
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "custom editor is not configured"))?;
+    let file = std::env::var_os(EDITOR_FILE_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "editor file is missing"))?;
+    let argv = editor_argv(&command, &file)?;
+    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+    let file_token = std::env::var(EDITOR_FILE_TOKEN_ENV).unwrap_or_default();
+    let heartbeat = if pane_id.is_empty() || file_token.is_empty() {
+        None
+    } else {
+        let _ = report_editor_identity(&pane_id, Some(&file_token));
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let heartbeat_pane = pane_id.clone();
+        let heartbeat_token = file_token.clone();
+        let handle = std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stop_rx.recv_timeout(EDITOR_HEARTBEAT_EVERY)
+            {
+                let _ = report_editor_identity(&heartbeat_pane, Some(&heartbeat_token));
+            }
+        });
+        Some((stop_tx, handle))
+    };
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status();
+    if let Some((stop_tx, handle)) = heartbeat {
+        let _ = stop_tx.send(());
+        let _ = handle.join();
+        let _ = report_editor_identity(&pane_id, None);
+    }
+    let status = status?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} exited with {status}",
+            argv[0]
+        )))
+    }
+}
+
+pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Result<()> {
+    let command = configured_editor().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "set HERDR_SIDEBAR_EDITOR, VISUAL, or EDITOR",
+        )
+    })?;
+    let panes = crate::ipc::call_text("pane.list", serde_json::json!({}))?;
+    let workspace_id = crate::launch::workspace_of(&panes, my_pane_id);
+    if workspace_id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not find the current workspace",
+        ));
+    }
+    let editor_file = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        root.join(file)
+    };
+    let file_token = editor_file_token(&editor_file);
+    if let Some((tab_id, pane_id)) =
+        editor_tab_for_file(&panes, &workspace_id, &file_token, crate::state::unix_now())
+    {
+        crate::viewer::focus_tab_for_client(&tab_id, Some(&pane_id));
+        return Ok(());
+    }
+    let mut env = crate::state::spawn_env()
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    env.insert(
+        EDITOR_COMMAND_ENV.into(),
+        serde_json::Value::String(command),
+    );
+    env.insert(
+        EDITOR_FILE_ENV.into(),
+        serde_json::Value::String(editor_file.display().to_string()),
+    );
+    env.insert(
+        EDITOR_FILE_TOKEN_ENV.into(),
+        serde_json::Value::String(file_token.clone()),
+    );
+    let label = file
+        .file_name()
+        .unwrap_or(file.as_os_str())
+        .to_string_lossy();
+    let response = crate::ipc::call_text(
+        "tab.create",
+        serde_json::json!({
+            "workspace_id": workspace_id,
+            "label": format!("{label} · editor"),
+            "cwd": root.display().to_string(),
+            "focus": false,
+            "env": env,
+        }),
+    )?;
+    let (tab_id, pane_id) = tab_create_ids(&response).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "editor tab opened without pane metadata",
+        )
+    })?;
+    if let Err(error) = report_editor_identity(&pane_id, Some(&file_token)) {
+        let _ = crate::ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+        return Err(error);
+    }
+    if let Err(error) = crate::ipc::call_text(
+        "pane.send_input",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "text": format!("{} --run-custom-editor", crate::state::EXECUTABLE_NAME),
+            "keys": ["Enter"],
+        }),
+    ) {
+        let _ = crate::ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+        return Err(error);
+    }
+    crate::viewer::focus_tab_for_client(&tab_id, Some(&pane_id));
+    Ok(())
+}
+
+fn editor_file_token(file: &Path) -> String {
+    let path = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let key = path.display().to_string();
+    #[cfg(windows)]
+    let key = key.replace('/', "\\").to_lowercase();
+    crate::viewer::document_token(&key)
+}
+
+fn editor_tab_for_file(
+    panes_json: &str,
+    workspace_id: &str,
+    file_token: &str,
+    now: u64,
+) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Msg {
+        result: Res,
+    }
+    #[derive(serde::Deserialize)]
+    struct Res {
+        #[serde(default)]
+        panes: Vec<Pane>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pane {
+        pane_id: Option<String>,
+        tab_id: Option<String>,
+        workspace_id: Option<String>,
+        #[serde(default)]
+        tokens: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    let msg = serde_json::from_str::<Msg>(crate::launch::strip_bom(panes_json)).ok()?;
+    msg.result.panes.into_iter().find_map(|pane| {
+        if pane.workspace_id.as_deref() != Some(workspace_id)
+            || pane.tokens.get(EDITOR_PATH_TOKEN)?.as_str()? != file_token
+        {
+            return None;
+        }
+        let heartbeat = pane
+            .tokens
+            .get(EDITOR_METADATA_SOURCE)?
+            .as_str()?
+            .parse::<u64>()
+            .ok()?;
+        if now.saturating_sub(heartbeat) > crate::launch::HEARTBEAT_STALE_SECS {
+            return None;
+        }
+        Some((pane.tab_id?, pane.pane_id?))
+    })
+}
+
+fn report_editor_identity(pane_id: &str, file_token: Option<&str>) -> io::Result<()> {
+    let heartbeat = file_token.map(|_| crate::state::unix_now().to_string());
+    crate::ipc::call_text(
+        "pane.report_metadata",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "source": EDITOR_METADATA_SOURCE,
+            "tokens": {
+                EDITOR_METADATA_SOURCE: heartbeat,
+                EDITOR_PATH_TOKEN: file_token,
+            },
+        }),
+    )?;
+    Ok(())
+}
+
+fn tab_create_ids(response: &str) -> Option<(String, String)> {
+    let value: serde_json::Value =
+        serde_json::from_str(response.trim_start_matches('\u{feff}')).ok()?;
+    let result = value.get("result")?;
+    let tab_id = result.get("tab")?.get("tab_id")?.as_str()?.to_string();
+    let pane_id = result
+        .get("root_pane")?
+        .get("pane_id")?
+        .as_str()?
+        .to_string();
+    Some((tab_id, pane_id))
+}
+
 /// Quote text embedded in a double-quoted AppleScript string literal.
 #[cfg(any(test, target_os = "macos"))]
 fn applescript_escape(text: &str) -> String {
@@ -270,7 +593,11 @@ fn parse_osascript_folder(success: bool, stdout: &[u8]) -> Option<PathBuf> {
         return None;
     }
     let trimmed = picked.trim_end_matches('/');
-    Some(if trimmed.is_empty() { PathBuf::from("/") } else { PathBuf::from(trimmed) })
+    Some(if trimmed.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(trimmed)
+    })
 }
 
 /// Native "choose a folder" dialog. The apps call this from a worker thread
@@ -323,7 +650,9 @@ mod tests {
     }
 
     fn has(entries: &[MenuEntry], action: MenuAction) -> bool {
-        entries.iter().any(|e| matches!(e, MenuEntry::Action(a, _) if *a == action))
+        entries
+            .iter()
+            .any(|e| matches!(e, MenuEntry::Action(a, _) if *a == action))
     }
 
     #[test]
@@ -338,19 +667,40 @@ mod tests {
 
     #[test]
     fn open_external_is_offered_for_files_only() {
-        assert!(has(&menu_entries(Some(false), true), MenuAction::OpenExternal), "file row");
-        assert!(!has(&menu_entries(Some(true), true), MenuAction::OpenExternal), "directory row");
-        assert!(!has(&menu_entries(None, true), MenuAction::OpenExternal), "empty space");
+        assert!(
+            has(&menu_entries(Some(false), true), MenuAction::OpenExternal),
+            "file row"
+        );
+        assert!(
+            !has(&menu_entries(Some(true), true), MenuAction::OpenExternal),
+            "directory row"
+        );
+        assert!(
+            !has(&menu_entries(None, true), MenuAction::OpenExternal),
+            "empty space"
+        );
         // Directories keep everything else they had.
         assert!(has(&menu_entries(Some(true), true), MenuAction::Rename));
     }
 
     #[test]
     fn stage_is_offered_for_rows_inside_a_repo_only() {
-        assert!(has(&menu_entries(Some(false), true), MenuAction::Stage), "file row");
-        assert!(has(&menu_entries(Some(true), true), MenuAction::Stage), "directory row");
-        assert!(!has(&menu_entries(None, true), MenuAction::Stage), "empty space");
-        assert!(!has(&menu_entries(Some(false), false), MenuAction::Stage), "outside a repo");
+        assert!(
+            has(&menu_entries(Some(false), true), MenuAction::Stage),
+            "file row"
+        );
+        assert!(
+            has(&menu_entries(Some(true), true), MenuAction::Stage),
+            "directory row"
+        );
+        assert!(
+            !has(&menu_entries(None, true), MenuAction::Stage),
+            "empty space"
+        );
+        assert!(
+            !has(&menu_entries(Some(false), false), MenuAction::Stage),
+            "outside a repo"
+        );
         assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
     }
 
@@ -376,6 +726,94 @@ mod tests {
     }
 
     #[test]
+    fn editor_command_is_split_without_a_shell_and_substitutes_the_file() {
+        let file = Path::new("C:/work/my project/main.rs");
+        assert_eq!(
+            editor_argv("nvim -f", file).unwrap(),
+            vec!["nvim", "-f", "C:/work/my project/main.rs"]
+        );
+        assert_eq!(
+            editor_argv("code --goto \"{file}:12\"", file).unwrap(),
+            vec!["code", "--goto", "C:/work/my project/main.rs:12"]
+        );
+        assert_eq!(
+            editor_argv(r#"C:\Tools\Code\code.exe --wait"#, file).unwrap(),
+            vec![
+                r#"C:\Tools\Code\code.exe"#,
+                "--wait",
+                "C:/work/my project/main.rs"
+            ]
+        );
+        assert_eq!(
+            editor_argv(r#""C:\Program Files\Code\code.exe" --wait"#, file).unwrap(),
+            vec![
+                r#"C:\Program Files\Code\code.exe"#,
+                "--wait",
+                "C:/work/my project/main.rs"
+            ]
+        );
+        assert!(editor_argv("\"unterminated", file).is_err());
+    }
+
+    #[test]
+    fn tab_create_response_exposes_editor_root_pane() {
+        let response = r#"{"result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p8"}}}"#;
+        assert_eq!(
+            tab_create_ids(response),
+            Some(("w1:t9".into(), "w1:p8".into()))
+        );
+        assert_eq!(tab_create_ids("garbage"), None);
+    }
+
+    #[test]
+    fn editor_tabs_reuse_only_the_live_matching_path_in_the_same_workspace() {
+        let first = editor_file_token(Path::new("/one/README.md"));
+        let second = editor_file_token(Path::new("/two/README.md"));
+        assert_ne!(first, second, "same-named files keep distinct identities");
+        let panes = serde_json::json!({
+            "result": { "panes": [
+                {
+                    "pane_id": "w1:p1",
+                    "tab_id": "w1:t1",
+                    "workspace_id": "w1",
+                    "tokens": {
+                        EDITOR_METADATA_SOURCE: "100",
+                        EDITOR_PATH_TOKEN: first,
+                    }
+                },
+                {
+                    "pane_id": "w2:p1",
+                    "tab_id": "w2:t1",
+                    "workspace_id": "w2",
+                    "tokens": {
+                        EDITOR_METADATA_SOURCE: "100",
+                        EDITOR_PATH_TOKEN: first,
+                    }
+                },
+                {
+                    "pane_id": "w1:p2",
+                    "tab_id": "w1:t2",
+                    "workspace_id": "w1",
+                    "tokens": {
+                        EDITOR_METADATA_SOURCE: "1",
+                        EDITOR_PATH_TOKEN: second,
+                    }
+                }
+            ] }
+        })
+        .to_string();
+        assert_eq!(
+            editor_tab_for_file(&panes, "w1", &first, 100),
+            Some(("w1:t1".into(), "w1:p1".into()))
+        );
+        assert_eq!(editor_tab_for_file(&panes, "w1", &second, 100), None);
+        assert_eq!(
+            editor_tab_for_file(&panes, "w2", &first, 100),
+            Some(("w2:t1".into(), "w2:p1".into()))
+        );
+    }
+
+    #[test]
     fn applescript_literals_escape_backslashes_before_quotes() {
         assert_eq!(applescript_escape("/tmp/plain"), "/tmp/plain");
         assert_eq!(applescript_escape(r#"/tmp/a"b"#), r#"/tmp/a\"b"#);
@@ -387,7 +825,10 @@ mod tests {
     fn osascript_picker_output_parsing_handles_cancel_root_and_trailing_slash() {
         assert_eq!(parse_osascript_folder(false, b"/ignored/\n"), None);
         assert_eq!(parse_osascript_folder(true, b"\n"), None);
-        assert_eq!(parse_osascript_folder(true, b"/\n"), Some(PathBuf::from("/")));
+        assert_eq!(
+            parse_osascript_folder(true, b"/\n"),
+            Some(PathBuf::from("/"))
+        );
         assert_eq!(
             parse_osascript_folder(true, b"/Users/alex/My Folder/\n"),
             Some(PathBuf::from("/Users/alex/My Folder"))

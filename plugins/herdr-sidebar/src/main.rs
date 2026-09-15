@@ -4,30 +4,51 @@
 //! separated mode the same binary runs one pane per view, pinned with
 //! `--view explorer|git`. `--preview <ctl>` runs the file-preview pane.
 //!
-//! The `--*` stdin→stdout helper modes serve the launcher scripts — see
-//! launch.rs.
+//! The native `--ensure` / `--toggle*` modes drive pane lifecycle; the other
+//! `--*` stdin→stdout helpers expose the unit-tested launch calculations.
 
 mod explorer_app;
 mod scm_app;
 
-use std::io::Read;
 use std::cell::RefCell;
+use std::io::Read;
 use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
-use herdr_sidebar::{launch, state, viewer};
+use herdr_sidebar::{ensure, launch, state, viewer};
 use state::{Exit, View};
 
 /// How often the source-control view re-reads `git status` while idle.
 const REFRESH_EVERY: Duration = Duration::from_millis(1500);
+const ANIMATION_FRAME: Duration = Duration::from_millis(120);
 
 fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
     match mode.as_deref() {
+        Some("--ensure") => return ensure::run(ensure::Mode::Ensure),
+        Some("--toggle") => {
+            return ensure::run(ensure::Mode::Toggle(View::Explorer));
+        }
+        Some("--toggle-git") => {
+            return ensure::run(ensure::Mode::Toggle(View::SourceControl));
+        }
+        Some("--show-explorer") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::Explorer));
+        }
+        Some("--show-search") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::Search));
+        }
+        Some("--show-git") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::SourceControl));
+        }
+        Some("--quick-open") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::QuickOpen));
+        }
+        Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),
         Some("--launch-decision") => {
-            // Optional second arg picks the source-control decision (the
-            // open-git launcher); default is the explorer/sidebar decision.
+            // Optional second arg picks the source-control decision; default
+            // is the explorer/sidebar decision.
             // Optional THIRD arg scopes the decision to a tab or workspace —
             // it must match the scope the hook docks into, or the decision
             // answers for one tab while the dock lands in another.
@@ -69,7 +90,10 @@ fn main() -> std::io::Result<()> {
         }
         Some("--open-plan") => {
             let state = state::load_state();
-            println!("{}", launch::open_plan(&read_stdin()?, state.dock_right, state.sidebar_width));
+            println!(
+                "{}",
+                launch::open_plan(&read_stdin()?, state.dock_right, state.sidebar_width)
+            );
             return Ok(());
         }
         Some("--event-kind") => {
@@ -87,7 +111,14 @@ fn main() -> std::io::Result<()> {
         Some("--auto-open") => {
             // Global ⚙ Settings value. Prefer `--should-auto-open` in hooks:
             // that also honors the per-workspace hide/toggle record.
-            println!("{}", if state::load_state().auto_open { "on" } else { "off" });
+            println!(
+                "{}",
+                if state::load_state().auto_open {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
             return Ok(());
         }
         Some("--should-auto-open") => {
@@ -130,11 +161,25 @@ fn main() -> std::io::Result<()> {
             // For the unix toggle launchers: skip the open-then-focus zoom
             // cycle when the user turned "Focus on open" off in ⚙ Settings,
             // so the sidebar docks in the background.
-            println!("{}", if state::load_state().focus_on_open { "on" } else { "off" });
+            println!(
+                "{}",
+                if state::load_state().focus_on_open {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
             return Ok(());
         }
         Some("--dock-right") => {
-            println!("{}", if state::load_state().dock_right { "right" } else { "left" });
+            println!(
+                "{}",
+                if state::load_state().dock_right {
+                    "right"
+                } else {
+                    "left"
+                }
+            );
             return Ok(());
         }
         Some("--preview") => {
@@ -158,7 +203,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--focused-workspace|--auto-open|--should-auto-open [ws]|--remember-sidebar on|off [ws]|--snooze-tab [scope]|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--focused-workspace|--auto-open|--should-auto-open [ws]|--remember-sidebar on|off [ws]|--snooze-tab [scope]|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -168,17 +213,47 @@ fn main() -> std::io::Result<()> {
     // Starting view: an explicit `--view` pin (separated panes), else the
     // last-active view when the unified sidebar is on.
     let pinned = if mode.as_deref() == Some("--view") {
-        std::env::args().nth(2).as_deref().and_then(View::from_view_flag)
+        std::env::args()
+            .nth(2)
+            .as_deref()
+            .and_then(View::from_view_flag)
     } else {
         None
     };
     let persisted = state::load_state();
+    let initial_activity = std::env::var(state::INITIAL_ACTIVITY_ENV)
+        .ok()
+        .and_then(|value| ensure::Target::from_env_value(&value));
     herdr_sidebar::ui::set_color_theme(persisted.color_theme);
-    let mut view = pinned.unwrap_or(if persisted.merged {
-        persisted.active
-    } else {
-        View::Explorer
-    });
+    let mut view = initial_activity.map_or_else(
+        || {
+            pinned.unwrap_or(if persisted.merged {
+                persisted.active
+            } else {
+                View::Explorer
+            })
+        },
+        ensure::Target::initial_view,
+    );
+
+    // Unix launchers use plugin.pane.open so Herdr starts this argv directly,
+    // with no shell prompt between the split and the TUI. Keep the host's cwd
+    // at the plugin root for relative-command resolution, then adopt the
+    // requested project cwd inside the process.
+    if let Some(cwd) = std::env::var_os(state::SPAWN_CWD_ENV).filter(|cwd| !cwd.is_empty()) {
+        std::env::set_current_dir(cwd)?;
+    }
+    // Mark the short interval before App::new applies its live identity. The
+    // launcher also writes a live stamp after plugin.pane.open returns, so any
+    // ordering between the two ends with App::new clearing this marker before
+    // the TUI can accept edits.
+    if let Some(pane_id) = std::env::var_os("HERDR_PANE_ID").filter(|id| !id.is_empty()) {
+        let _ = herdr_sidebar::ipc::report_starting_identity(
+            &pane_id.to_string_lossy(),
+            view,
+            view == View::Explorer && persisted.merged,
+        );
+    }
 
     // ONE terminal session for every view: switching drops the old view's
     // state and draws the other in the same alternate screen — instant, and
@@ -205,31 +280,49 @@ fn main() -> std::io::Result<()> {
     let workspace_label = workspace_label();
     let spawn_cwd = std::env::current_dir()?;
     let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
+    // Some(focus_query) opens the Search view on the next Explorer render;
+    // None doesn't. A resumed search restores unfocused (a switch, not a find).
+    let mut search_on_open: Option<bool> = if initial_activity == Some(ensure::Target::Search) {
+        Some(false)
+    } else {
+        (pinned.is_none()
+            && persisted.merged
+            && persisted.active == View::Explorer
+            && persisted.search_active)
+            .then_some(false)
+    };
+    let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
     let result = loop {
         let exit = match view {
-            View::Explorer => {
-                run_explorer(
-                    &mut terminal,
-                    Rc::clone(&cwd_follower),
-                    &root_key,
-                    &workspace_label,
-                    &spawn_cwd,
-                )
-            }
-            View::SourceControl => {
-                run_scm(
-                    &mut terminal,
-                    Rc::clone(&cwd_follower),
-                    &root_key,
-                    &workspace_label,
-                    &spawn_cwd,
-                )
-            }
+            View::Explorer => run_explorer(
+                &mut terminal,
+                Rc::clone(&cwd_follower),
+                &root_key,
+                &workspace_label,
+                &spawn_cwd,
+                std::mem::take(&mut search_on_open),
+                std::mem::take(&mut quick_open_on_open),
+            ),
+            View::SourceControl => run_scm(
+                &mut terminal,
+                Rc::clone(&cwd_follower),
+                &root_key,
+                &workspace_label,
+                &spawn_cwd,
+            ),
         };
         match exit {
             Ok(Exit::Quit) => break Ok(()),
             Ok(Exit::Switch) => {
                 view = view.other();
+            }
+            Ok(Exit::Search { focus_query }) => {
+                view = View::Explorer;
+                search_on_open = Some(focus_query);
+            }
+            Ok(Exit::QuickOpen) => {
+                view = View::Explorer;
+                quick_open_on_open = true;
             }
             Err(e) => break Err(e),
         }
@@ -248,7 +341,9 @@ fn read_stdin() -> std::io::Result<String> {
 /// The label of the space this pane lives in, or "" when it can't be
 /// resolved — the caller then falls back to the pane's cwd.
 fn workspace_label() -> String {
-    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else { return String::new() };
+    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else {
+        return String::new();
+    };
     herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({}))
         .map(|json| herdr_sidebar::launch::workspace_label(&json, &ws_id))
         .unwrap_or_default()
@@ -302,15 +397,28 @@ fn run_explorer(
     root_key: &str,
     legacy_workspace_label: &str,
     spawn_cwd: &std::path::Path,
+    search_on_open: Option<bool>,
+    quick_open_on_open: bool,
 ) -> std::io::Result<Exit> {
     let root = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
     let mut remembered_root = root.clone();
     let mut app = explorer_app::App::new(root, cwd_follower);
+    if let Some(focus_query) = search_on_open {
+        app.open_content_search(focus_query);
+    }
+    if quick_open_on_open {
+        app.open_quick_open();
+    }
     loop {
         terminal.draw(|frame| app.draw(frame))?;
         // 500ms: quick enough that a finished folder pick lands promptly,
         // still cheap for the heartbeat.
-        if event::poll(Duration::from_millis(500))? {
+        let timeout = if app.is_syncing() {
+            ANIMATION_FRAME
+        } else {
+            Duration::from_millis(500)
+        };
+        if event::poll(timeout)? {
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
@@ -353,7 +461,10 @@ fn run_scm(
     let mut last_tick = std::time::Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        let timeout = REFRESH_EVERY.saturating_sub(last_tick.elapsed());
+        let mut timeout = REFRESH_EVERY.saturating_sub(last_tick.elapsed());
+        if app.is_syncing() {
+            timeout = timeout.min(ANIMATION_FRAME);
+        }
         if event::poll(timeout)? {
             let exit = match event::read()? {
                 Event::Key(key) => app.on_key(key),

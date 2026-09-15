@@ -30,6 +30,21 @@ fn parse_line(raw: &str) -> Line<'static> {
             }
             continue;
         }
+        // OSC sequences carry terminal metadata such as hyperlinks. Consume
+        // the whole payload through BEL or ST so none of it becomes text.
+        if chars.peek() == Some(&']') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\u{7}' {
+                    break;
+                }
+                if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
         // Escape sequence: only CSI ... 'm' (SGR) is interpreted.
         if chars.peek() != Some(&'[') {
             continue;
@@ -160,7 +175,12 @@ mod tests {
     #[test]
     fn bold_headers_and_resets() {
         let lines = to_lines("\u{1b}[1mdiff --git a/x b/x\u{1b}[m plain");
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(lines[0].to_string(), "diff --git a/x b/x plain");
     }
 
@@ -176,5 +196,17 @@ mod tests {
     fn non_sgr_escapes_are_dropped() {
         let lines = to_lines("a\u{1b}[2Kb\u{1b}[Hc");
         assert_eq!(lines[0].to_string(), "abc");
+    }
+
+    #[test]
+    fn osc_hyperlinks_are_consumed_through_bel_or_st() {
+        let bel =
+            to_lines("Read \u{1b}]8;id=docs;https://example.com\u{7}the docs\u{1b}]8;;\u{7} now");
+        assert_eq!(bel[0].to_string(), "Read the docs now");
+
+        let st = to_lines(
+            "Read \u{1b}]8;id=docs;https://example.com\u{1b}\\the docs\u{1b}]8;;\u{1b}\\ now",
+        );
+        assert_eq!(st[0].to_string(), "Read the docs now");
     }
 }

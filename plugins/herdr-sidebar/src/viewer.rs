@@ -18,9 +18,7 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Style, Stylize};
-#[cfg(test)]
-use ratatui::style::Color;
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
@@ -37,6 +35,9 @@ pub const METADATA_SOURCE: &str = "herdr-sidebar-preview";
 
 /// How often the control file is re-checked while idle.
 const POLL: Duration = Duration::from_millis(250);
+/// Once a worker is active, collect it promptly instead of sleeping for a
+/// second idle interval before replacing the loading frame.
+const LOAD_POLL: Duration = Duration::from_millis(16);
 
 /// Preview size guards: don't slurp huge files into a pane.
 const MAX_BYTES: usize = 1024 * 1024;
@@ -109,7 +110,7 @@ fn control_from_token(token: &str) -> PathBuf {
     }
 }
 
-fn document_token(doc_key: &str) -> String {
+pub(crate) fn document_token(doc_key: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in doc_key.as_bytes() {
         hash ^= u64::from(*byte);
@@ -173,7 +174,7 @@ impl Request {
     fn doc_key(&self) -> String {
         match self {
             Self::Close => String::new(),
-            Self::File(p) => doc_key_for_file(p),
+            Self::File { path, .. } => doc_key_for_file(path),
             Self::Diff { root, rel, kind } => doc_key_for_diff(root, rel, kind),
             Self::Show { root, spec, path } => doc_key_for_show(root, spec, path.as_deref()),
         }
@@ -186,7 +187,11 @@ enum Request {
     /// Graceful close request from the sidebar. The viewer gets a chance to
     /// confirm unsaved edits before it closes its own pane.
     Close,
-    File(PathBuf),
+    File {
+        path: PathBuf,
+        /// One-based source line to place at the top of the preview.
+        line: Option<usize>,
+    },
     Diff {
         root: PathBuf,
         rel: String,
@@ -205,6 +210,11 @@ enum Request {
 /// Control-file payload for a file preview.
 pub fn file_request(path: &Path) -> String {
     format!("file\t{}", path.display())
+}
+
+/// Control-file payload for a file preview anchored to a one-based source line.
+pub fn file_request_at(path: &Path, line: usize) -> String {
+    format!("file\t{}\t{line}", path.display())
 }
 
 /// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
@@ -238,16 +248,27 @@ fn parse_request(raw: &str) -> Option<Request> {
             let path = parts.next().filter(|p| !p.is_empty()).map(str::to_string);
             Some(Request::Show { root, spec, path })
         }
-        Some("file") => Some(Request::File(PathBuf::from(parts.next()?))),
+        Some("file") => Some(Request::File {
+            path: PathBuf::from(parts.next()?),
+            line: parts
+                .next()
+                .and_then(|line| line.parse().ok())
+                .filter(|line| *line > 0),
+        }),
         // Legacy: a bare path.
-        _ => Some(Request::File(PathBuf::from(raw))),
+        _ => Some(Request::File {
+            path: PathBuf::from(raw),
+            line: None,
+        }),
     }
 }
 
 fn request_payload(request: &Request) -> String {
     match request {
         Request::Close => "close".into(),
-        Request::File(path) => file_request(path),
+        Request::File { path, line } => line
+            .map(|line| file_request_at(path, line))
+            .unwrap_or_else(|| file_request(path)),
         Request::Diff { root, rel, kind } => diff_request(root, rel, kind),
         Request::Show { root, spec, path } => show_request(root, spec, path.as_deref()),
     }
@@ -259,6 +280,9 @@ struct Doc {
     lines: Vec<Line<'static>>,
     /// File previews get a line-number gutter; diffs carry their own +/-.
     numbered: bool,
+    /// Decoded raster media, rendered portably with true-color half blocks.
+    /// Video files carry the poster frame extracted by ffmpeg.
+    media: Option<MediaPreview>,
     /// Offset into [`Doc::rows`] — RENDERED rows, not source lines, so a
     /// wrapped line's continuations are scrolled to like anything else.
     scroll: usize,
@@ -268,13 +292,20 @@ struct Doc {
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
-    /// The (width, wrap) `rows` was built for; `None` until first draw.
-    rows_key: Option<(u16, bool)>,
+    /// The (width, height, wrap) `rows` was built for; `None` until first draw.
+    rows_key: Option<(u16, u16, bool)>,
     /// Source line to scroll back to once `rows` is rebuilt — how a wrap
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
     pending_src: Option<usize>,
     selection: PreviewSelection,
+}
+
+struct MediaPreview {
+    pixels: image::RgbaImage,
+    source_width: u32,
+    source_height: u32,
+    video_poster: bool,
 }
 
 /// One rendered row of the body: the source line it came from (so scroll
@@ -298,12 +329,16 @@ struct PreviewSelection {
 }
 
 impl Doc {
-    /// Rebuild [`Doc::rows`] for `width` when the layout inputs changed,
+    /// Rebuild [`Doc::rows`] for the viewport when the layout inputs changed,
     /// then honour any pending source-line scroll request.
-    fn relayout(&mut self, width: u16) {
-        if self.rows_key != Some((width, self.wrap)) {
-            self.rows = build_rows(&self.lines, self.numbered, self.wrap, width);
-            self.rows_key = Some((width, self.wrap));
+    fn relayout(&mut self, width: u16, height: u16) {
+        if self.rows_key != Some((width, height, self.wrap)) {
+            self.rows = if let Some(media) = &self.media {
+                render_media_rows(media, width, height)
+            } else {
+                build_rows(&self.lines, self.numbered, self.wrap, width)
+            };
+            self.rows_key = Some((width, height, self.wrap));
             self.selection = PreviewSelection::default();
         }
         if let Some(src) = self.pending_src.take() {
@@ -330,6 +365,9 @@ impl Doc {
     }
 
     fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
+        if self.media.is_some() {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
@@ -392,6 +430,9 @@ impl Doc {
     }
 
     fn select_all(&mut self) {
+        if self.media.is_some() {
+            return;
+        }
         let Some(last) = self.rows.last() else { return };
         let last_col = row_text_without_gutter(last, self.gutter()).chars().count();
         self.selection.anchor = Some(RenderPos::default());
@@ -493,6 +534,80 @@ fn selected_row(
     rendered
 }
 
+fn media_pixel(pixel: image::Rgba<u8>) -> Option<(u8, u8, u8)> {
+    let alpha = u16::from(pixel[3]);
+    if alpha < 8 {
+        return None;
+    }
+    let base = if crate::ui::is_light() { 255 } else { 0 };
+    let blend = |channel: u8| ((u16::from(channel) * alpha + base * (255 - alpha)) / 255) as u8;
+    Some((blend(pixel[0]), blend(pixel[1]), blend(pixel[2])))
+}
+
+/// Render raster media without relying on terminal-specific image protocols.
+/// One `▀` cell carries an upper pixel in its foreground and a lower pixel in
+/// its background, giving the pane two vertical pixels per terminal row.
+fn render_media_rows(media: &MediaPreview, width: u16, height: u16) -> Vec<Row> {
+    if width == 0 || height == 0 || media.source_width == 0 || media.source_height == 0 {
+        return Vec::new();
+    }
+    let max_pixel_height = u32::from(height).saturating_mul(2);
+    let scale = (f64::from(width) / f64::from(media.source_width))
+        .min(f64::from(max_pixel_height) / f64::from(media.source_height));
+    let target_width = (f64::from(media.source_width) * scale).round().max(1.0) as u32;
+    let target_height = (f64::from(media.source_height) * scale).round().max(1.0) as u32;
+    let pixels = image::imageops::resize(
+        &media.pixels,
+        target_width,
+        target_height,
+        image::imageops::FilterType::Triangle,
+    );
+    let rendered_height = target_height.div_ceil(2) as u16;
+    let top_pad = height.saturating_sub(rendered_height) / 2;
+    let left_pad = usize::from(width.saturating_sub(target_width as u16) / 2);
+    let mut rows = Vec::with_capacity(usize::from(top_pad + rendered_height));
+    for src in 0..usize::from(top_pad) {
+        rows.push(Row {
+            src,
+            line: Line::default(),
+        });
+    }
+    for pixel_y in (0..target_height).step_by(2) {
+        let mut spans = Vec::with_capacity(target_width as usize + 1);
+        if left_pad > 0 {
+            spans.push(Span::raw(" ".repeat(left_pad)));
+        }
+        for pixel_x in 0..target_width {
+            let upper = media_pixel(*pixels.get_pixel(pixel_x, pixel_y));
+            let lower = (pixel_y + 1 < target_height)
+                .then(|| media_pixel(*pixels.get_pixel(pixel_x, pixel_y + 1)))
+                .flatten();
+            let span = match (upper, lower) {
+                (Some(top), Some(bottom)) => Span::styled(
+                    "▀",
+                    Style::default()
+                        .fg(Color::Rgb(top.0, top.1, top.2))
+                        .bg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
+                ),
+                (Some(top), None) => {
+                    Span::styled("▀", Style::default().fg(Color::Rgb(top.0, top.1, top.2)))
+                }
+                (None, Some(bottom)) => Span::styled(
+                    "▄",
+                    Style::default().fg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
+                ),
+                (None, None) => Span::raw(" "),
+            };
+            spans.push(span);
+        }
+        rows.push(Row {
+            src: rows.len(),
+            line: Line::from(spans),
+        });
+    }
+    rows
+}
+
 /// Lay `lines` out for a `width`-wide body: wrap each source line (when
 /// wrapping is on), prefix the line-number gutter (blank on continuation
 /// rows, like an editor), and pad tinted diff rows to the full width.
@@ -547,6 +662,7 @@ fn load(request: &Request) -> Doc {
             context: String::new(),
             lines: vec![Line::raw("(closing)")],
             numbered: false,
+            media: None,
             scroll: 0,
             wrap: true,
             rows: Vec::new(),
@@ -554,10 +670,52 @@ fn load(request: &Request) -> Doc {
             pending_src: None,
             selection: PreviewSelection::default(),
         },
-        Request::File(path) => load_file(path),
+        Request::File { path, line } => load_file(path, *line),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
+}
+
+/// Lightweight first frame while parsing/decoding happens off the terminal
+/// event loop. Large media, an external markdown renderer, or a cold syntax
+/// grammar must never make a preview swap look like the click was ignored.
+fn loading_doc(request: &Request) -> Doc {
+    let (name, context) = match request {
+        Request::Close => ("Preview".into(), String::new()),
+        Request::File { path, .. } => (
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            path.display().to_string(),
+        ),
+        Request::Diff { root, rel, .. } => (
+            rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            root.display().to_string(),
+        ),
+        Request::Show { root, spec, .. } => (spec.clone(), root.display().to_string()),
+    };
+    Doc {
+        name,
+        context,
+        lines: vec![Line::raw("(loading preview…)")],
+        numbered: false,
+        media: None,
+        scroll: 0,
+        wrap: true,
+        rows: Vec::new(),
+        rows_key: None,
+        pending_src: None,
+        selection: PreviewSelection::default(),
+    }
+}
+
+fn start_preview_load(request: Request) -> (Request, std::sync::mpsc::Receiver<Doc>) {
+    let worker_request = request.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(load(&worker_request));
+    });
+    (request, receiver)
 }
 
 fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
@@ -612,14 +770,17 @@ fn apply_pending(
     pending: Pending,
     mode: &mut ViewMode,
     current: &mut Option<Request>,
+    preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
+    identity_pending: &mut bool,
     control: &Path,
 ) -> bool {
     match pending {
         Pending::Close => close_own_pane(control),
         Pending::LeaveEdit => {
-            if let Some(request) = current.as_ref() {
-                *mode = ViewMode::Preview(load(request));
-                report_identity(mode, Some(&request.doc_key()), control);
+            if let Some(request) = current.clone() {
+                *mode = ViewMode::Preview(loading_doc(&request));
+                *preview_load = Some(start_preview_load(request));
+                *identity_pending = true;
             }
             false
         }
@@ -627,13 +788,10 @@ fn apply_pending(
             if request == Request::Close {
                 close_own_pane(control)
             } else {
-                *mode = ViewMode::Preview(load(&request));
-                *current = Some(request);
-                report_identity(
-                    mode,
-                    current.as_ref().map(Request::doc_key).as_deref(),
-                    control,
-                );
+                *mode = ViewMode::Preview(loading_doc(&request));
+                *current = Some(request.clone());
+                *preview_load = Some(start_preview_load(request));
+                *identity_pending = true;
                 false
             }
         }
@@ -688,6 +846,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         context: format!("git show {spec} — {}", root.display()),
         lines,
         numbered: false,
+        media: None,
         scroll: 0,
         wrap: true,
         rows: Vec::new(),
@@ -735,12 +894,271 @@ fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
-fn load_file(target: &Path) -> Doc {
+const MAX_MEDIA_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_MEDIA_PIXELS: u64 = 12_000_000;
+const MAX_MEDIA_DIMENSION: u32 = 8192;
+const MAX_MEDIA_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_VIDEO_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+const VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn has_extension(target: &Path, extensions: &[&str]) -> bool {
+    target
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extensions
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+fn is_image_file(target: &Path) -> bool {
+    has_extension(
+        target,
+        &[
+            "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp",
+        ],
+    )
+}
+
+fn is_video_file(target: &Path) -> bool {
+    has_extension(
+        target,
+        &[
+            "avi", "flv", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm", "wmv",
+        ],
+    )
+}
+
+fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
+    let file_bytes = std::fs::metadata(target)
+        .map_err(|error| error.to_string())?
+        .len();
+    if file_bytes > MAX_MEDIA_FILE_BYTES {
+        return Err(format!(
+            "image file is too large ({} MiB limit)",
+            MAX_MEDIA_FILE_BYTES / 1024 / 1024
+        ));
+    }
+    let (width, height) = image::image_dimensions(target).map_err(|error| error.to_string())?;
+    if width > MAX_MEDIA_DIMENSION
+        || height > MAX_MEDIA_DIMENSION
+        || u64::from(width).saturating_mul(u64::from(height)) > MAX_MEDIA_PIXELS
+    {
+        return Err(format!("image is too large ({width}×{height})"));
+    }
+    let mut reader = image::ImageReader::open(target)
+        .map_err(|error| error.to_string())?
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
+    limits.max_image_height = Some(MAX_MEDIA_DIMENSION);
+    limits.max_alloc = Some(MAX_MEDIA_ALLOC_BYTES);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map(|image| image.to_rgba8())
+        .map_err(|error| error.to_string())
+}
+
+fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
+    let executable = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    std::env::split_paths(path)
+        .filter(|directory| directory.is_absolute())
+        .filter_map(|directory| directory.canonicalize().ok())
+        .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
+        .map(|directory| directory.join(executable))
+        .find(|candidate| {
+            if !candidate.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                candidate
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            true
+        })
+}
+
+fn ffmpeg_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    ffmpeg_in_path(&path, cwd.as_deref())
+}
+
+fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
+    let ffmpeg =
+        ffmpeg_on_path().ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
+    let mut command = std::process::Command::new(ffmpeg);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-ss",
+        "0",
+        "-i",
+    ]);
+    command.arg(target);
+    command.args([
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1280:720:force_original_aspect_ratio=decrease",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "pipe:1",
+    ]);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("ffmpeg failed: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ffmpeg stderr unavailable".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stdout)
+            .take(MAX_VIDEO_FRAME_BYTES + 1)
+            .read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + VIDEO_FRAME_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("video poster timed out after 4 seconds".into());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("ffmpeg status failed: {error}"));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "ffmpeg output reader failed".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "ffmpeg error reader failed".to_string())?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(format!(
+            "ffmpeg could not read video: {}",
+            stderr.lines().next().unwrap_or("unknown error")
+        ));
+    }
+    if stdout.len() as u64 > MAX_VIDEO_FRAME_BYTES {
+        return Err("video poster frame exceeded 16 MiB".into());
+    }
+    image::load_from_memory_with_format(&stdout, image::ImageFormat::Png)
+        .map(|image| image.to_rgba8())
+        .map_err(|error| format!("could not decode video frame: {error}"))
+}
+
+fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
+    let result = if video_poster {
+        decode_video_poster(target)
+    } else {
+        decode_image_file(target)
+    };
+    let (lines, media, context) = match result {
+        Ok(pixels) => {
+            let (source_width, source_height) = pixels.dimensions();
+            let kind = if video_poster {
+                "video poster"
+            } else {
+                "image"
+            };
+            (
+                Vec::new(),
+                Some(MediaPreview {
+                    pixels,
+                    source_width,
+                    source_height,
+                    video_poster,
+                }),
+                format!(
+                    "{} — {source_width}×{source_height} {kind}",
+                    target.display()
+                ),
+            )
+        }
+        Err(error) => (
+            vec![Line::raw(format!("({error})"))],
+            None,
+            target.display().to_string(),
+        ),
+    };
+    Doc {
+        name,
+        context,
+        lines,
+        numbered: false,
+        media,
+        scroll: 0,
+        wrap: false,
+        rows: Vec::new(),
+        rows_key: None,
+        pending_src: None,
+        selection: PreviewSelection::default(),
+    }
+}
+
+fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
     let lower = name.to_lowercase();
+    if is_image_file(target) {
+        return load_media_file(target, name, false);
+    }
+    if is_video_file(target) {
+        return load_media_file(target, name, true);
+    }
     let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
     let (lines, numbered) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true),
@@ -759,7 +1177,7 @@ fn load_file(target: &Path) -> Doc {
                 let glow_width = crossterm::terminal::size()
                     .map(|(w, _)| w.saturating_sub(6))
                     .unwrap_or(74);
-                let glow_rendered = is_markdown
+                let glow_rendered = (is_markdown && target_line.is_none())
                     .then(|| glow_markdown(&text, glow_width))
                     .flatten();
                 // Glow-rendered markdown gets no line numbers (it formats its own layout).
@@ -789,11 +1207,12 @@ fn load_file(target: &Path) -> Doc {
         context: target.display().to_string(),
         lines,
         numbered,
+        media: None,
         scroll: 0,
         wrap: true,
         rows: Vec::new(),
         rows_key: None,
-        pending_src: None,
+        pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
     }
 }
@@ -851,6 +1270,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         context: format!("{} — {what} diff", root.join(rel).display()),
         lines,
         numbered: false,
+        media: None,
         scroll: 0,
         wrap: true,
         rows: Vec::new(),
@@ -984,19 +1404,44 @@ fn close_own_pane(control: &Path) -> bool {
     true
 }
 
+/// Bring the VIEWING client to `tab_id`. Since herdr 0.9 each client views
+/// its own tab: `tab.focus` (and `pane.move`'s `focus: true`) only update the
+/// session-wide focus record, which a client no longer follows, so the tab
+/// opened "in the back" and the origin tab was left with a stale split.
+/// `pane.focus` is the one call that still moves the client — but only on a
+/// TRANSITION: if the server already records the target as focused (it kept
+/// that record from the last preview while the user clicked elsewhere), the
+/// call changes nothing and emits nothing. Step through another pane first
+/// in that case. Falls back to `tab.focus` for hosts older than 0.9 and for
+/// tabs whose panes cannot be listed.
+pub(crate) fn focus_tab_for_client(tab_id: &str, pane_id: Option<&str>) {
+    let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+    let pane = match pane_id {
+        Some(pane) if !pane.is_empty() => pane.to_string(),
+        _ => crate::launch::pane_in_tab(&list, tab_id),
+    };
+    if pane.is_empty() {
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": tab_id }));
+        return;
+    }
+    if crate::launch::server_focused_pane_id(&list) == pane {
+        let step = crate::launch::pane_outside_tab(&list, tab_id);
+        if !step.is_empty() {
+            let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": step }));
+        }
+    }
+    if ipc::call_text("pane.focus", serde_json::json!({ "pane_id": pane })).is_err() {
+        let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": tab_id }));
+    }
+}
+
 fn close_preview_tab(preview: &PreviewPane) {
     // Focus first: closing our own tab kills this process, so code after a
     // successful tab.close is not guaranteed to run.
     if !preview.origin_tab_id.is_empty() {
-        let _ = ipc::call_text(
-            "tab.focus",
-            serde_json::json!({ "tab_id": preview.origin_tab_id }),
-        );
+        focus_tab_for_client(&preview.origin_tab_id, None);
     }
-    let _ = ipc::call_text(
-        "tab.close",
-        serde_json::json!({ "tab_id": preview.tab_id }),
-    );
+    let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": preview.tab_id }));
 }
 
 /// The first edit that dirties the buffer pins this document's tab, so the
@@ -1084,11 +1529,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         crate::state::load_state().icons,
     );
     let mut current = read_control(control);
-    let doc = current.as_ref().map(load).unwrap_or_else(|| Doc {
+    let mut preview_load = current.clone().map(start_preview_load);
+    let doc = current.as_ref().map(loading_doc).unwrap_or_else(|| Doc {
         name: "(nothing to show)".into(),
         context: String::new(),
         lines: vec![Line::raw("(waiting for a click in the sidebar)")],
         numbered: false,
+        media: None,
         scroll: 0,
         wrap: true,
         rows: Vec::new(),
@@ -1123,7 +1570,26 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
+    let mut identity_pending = false;
     let result = loop {
+        let loaded =
+            preview_load
+                .as_ref()
+                .and_then(|(request, receiver)| match receiver.try_recv() {
+                    Ok(doc) => Some((request.clone(), Some(doc))),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some((request.clone(), None))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some((request, loaded)) = loaded {
+            preview_load = None;
+            if current.as_ref() == Some(&request)
+                && let (ViewMode::Preview(doc), Some(loaded)) = (&mut mode, loaded)
+            {
+                *doc = loaded;
+            }
+        }
         let prompt_text = prompt.as_ref().map(Prompt::text);
         let draw = terminal.draw(|frame| match &mut mode {
             ViewMode::Preview(doc) => {
@@ -1131,7 +1597,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     frame,
                     doc,
                     theme,
-                    matches!(current, Some(Request::File(_))),
+                    matches!(current, Some(Request::File { .. })),
                     notice.as_deref(),
                 );
             }
@@ -1142,8 +1608,21 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Err(e) = draw {
             break Err(e);
         }
+        if identity_pending {
+            report_identity(
+                &mode,
+                current.as_ref().map(Request::doc_key).as_deref(),
+                control,
+            );
+            identity_pending = false;
+        }
         let mut should_close = false;
-        if event::poll(POLL)? {
+        let poll = if preview_load.is_some() {
+            LOAD_POLL
+        } else {
+            POLL
+        };
+        if event::poll(poll)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(active_prompt) = prompt.take() {
@@ -1156,6 +1635,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 pending,
                                                 &mut mode,
                                                 &mut current,
+                                                &mut preview_load,
+                                                &mut identity_pending,
                                                 control,
                                             );
                                         }
@@ -1170,8 +1651,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 }
                             }
                             (Prompt::Unsaved(pending), KeyCode::Char('d')) => {
-                                should_close =
-                                    apply_pending(pending, &mut mode, &mut current, control);
+                                should_close = apply_pending(
+                                    pending,
+                                    &mut mode,
+                                    &mut current,
+                                    &mut preview_load,
+                                    &mut identity_pending,
+                                    control,
+                                );
                             }
                             (Prompt::Unsaved(_), KeyCode::Esc | KeyCode::Char('c')) => {
                                 restore_current_control(control, &current);
@@ -1190,6 +1677,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     pending,
                                                     &mut mode,
                                                     &mut current,
+                                                    &mut preview_load,
+                                                    &mut identity_pending,
                                                     control,
                                                 );
                                             }
@@ -1211,6 +1700,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                     pending,
                                                     &mut mode,
                                                     &mut current,
+                                                    &mut preview_load,
+                                                    &mut identity_pending,
                                                     control,
                                                 );
                                             }
@@ -1258,10 +1749,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         should_close = close_own_pane(control);
                                     }
                                     KeyCode::Char('e') => {
-                                        if let Some(Request::File(path)) = current.as_ref() {
+                                        if doc.media.is_some() {
+                                            notice = Some("media previews are read-only".into());
+                                        } else if let Some(Request::File { path, .. }) =
+                                            current.as_ref()
+                                        {
                                             match Editor::open(path, MAX_BYTES, MAX_LINES) {
                                                 Ok(editor) => {
                                                     mode = ViewMode::Edit(editor);
+                                                    preview_load = None;
                                                     notice = None;
                                                     report_identity(
                                                         &mode,
@@ -1290,7 +1786,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
-                                    KeyCode::Char('w') => {
+                                    KeyCode::Char('w') if doc.media.is_none() => {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
@@ -1316,6 +1812,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                                 Pending::LeaveEdit,
                                                 &mut mode,
                                                 &mut current,
+                                                &mut preview_load,
+                                                &mut identity_pending,
                                                 control,
                                             );
                                         }
@@ -1409,14 +1907,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         break Ok(());
                     }
                 } else {
-                    mode = ViewMode::Preview(load(&request));
-                    current = Some(request);
+                    mode = ViewMode::Preview(loading_doc(&request));
+                    current = Some(request.clone());
+                    preview_load = Some(start_preview_load(request));
+                    identity_pending = true;
                     notice = None;
-                    report_identity(
-                        &mode,
-                        current.as_ref().map(Request::doc_key).as_deref(),
-                        control,
-                    );
                 }
             }
         }
@@ -1445,7 +1940,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             }
         }
         if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
-            if diff_refresh.is_none()
+            if preview_load.is_none()
+                && diff_refresh.is_none()
                 && matches!(mode, ViewMode::Preview(_))
                 && let Some(request @ Request::Diff { .. }) = current.clone()
             {
@@ -1483,7 +1979,7 @@ fn draw_doc(
 
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
-    doc.relayout(body.width);
+    doc.relayout(body.width, body.height);
     doc.scroll = doc.scroll.min(
         doc.rows
             .len()
@@ -1540,6 +2036,12 @@ fn draw_doc(
     };
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
+    } else if let Some(media) = &doc.media {
+        if media.video_poster {
+            " video poster frame  q close".into()
+        } else {
+            " image preview  q close".into()
+        }
     } else if editable {
         format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
     } else {
@@ -1575,7 +2077,10 @@ fn draw_editor(
         Span::styled(" ✕ ", Style::default().bold().fg(palette().header_accent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
         Span::styled(format!("{name}{dirty}"), Style::default().bold()),
-        Span::styled("  EDIT (experimental)", Style::default().fg(palette().warning)),
+        Span::styled(
+            "  EDIT (experimental)",
+            Style::default().fg(palette().warning),
+        ),
         Span::styled(external, Style::default().fg(palette().conflict).bold()),
     ];
     let used: usize = left.iter().map(Span::width).sum();
@@ -1658,16 +2163,16 @@ pub fn open_in_pane(
     previews.sort_by(|a, b| a.tab_id.cmp(&b.tab_id).then(a.pane_id.cmp(&b.pane_id)));
     // An inline viewer belongs to ONE tab: never route this tab's clicks into
     // another tab's pane, and never let a tab-mode click adopt one.
-    previews.retain(|preview| {
-        preview.inline == inline && (!inline || preview.tab_id == caller_tab_id)
-    });
+    previews
+        .retain(|preview| preview.inline == inline && (!inline || preview.tab_id == caller_tab_id));
     let origin_tab_id = preview_origin_tab(&previews, &caller_tab_id);
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
+        write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
         if !inline {
-            let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+            focus_tab_for_client(&p.tab_id, Some(&p.pane_id));
         }
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
@@ -1682,7 +2187,7 @@ pub fn open_in_pane(
         write_scratch_file(&p.control, payload).map_err(|e| format!("preview failed: {e}"))?;
         remember_origin(&p.pane_id, &origin_tab_id);
         if !inline {
-            let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": p.tab_id }));
+            focus_tab_for_client(&p.tab_id, Some(&p.pane_id));
         }
         return Ok(PreviewTarget {
             pane_id: p.pane_id,
@@ -1768,10 +2273,12 @@ fn target_is_showing(previews: &[PreviewPane], target: &PreviewTarget, doc_key: 
     })
 }
 
-/// Spawn a preview and give it its own tab. The pane is split beside the
-/// sidebar first and then MOVED out: `tab.create` would leave a stray shell
-/// pane, and the move reuses the proven `pane.move` path. The `tab.created`
-/// hook docks a sidebar alongside it, so the tree stays reachable.
+/// Spawn a preview in a tab of its own. The viewer is the new tab's ROOT
+/// pane (`tab.create` with the viewer's cwd/env), so the origin tab is never
+/// split into and never has a pane moved out of it — on herdr 0.9 those two
+/// layout changes reached the client as a visible flicker, and its re-fit of
+/// the origin tab lagged. The `tab.created` hook docks a sidebar alongside,
+/// so the tree stays reachable.
 fn spawn_preview_tab(
     my_pane_id: &str,
     spawn_cwd: &Path,
@@ -1779,32 +2286,7 @@ fn spawn_preview_tab(
     payload: &str,
     origin_tab_id: &str,
 ) -> Result<PreviewTarget, String> {
-    let (new_pane, control) = spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload, None)?;
-    let moved = match ipc::call_text(
-        "pane.move",
-        serde_json::json!({
-            "pane_id": new_pane,
-            "destination": { "type": "new_tab", "label": tab_label(doc_key, false) },
-            "focus": true,
-        }),
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            cleanup_spawn(&new_pane, &control);
-            return Err(format!("preview tab failed to open: {error}"));
-        }
-    };
-    if !pane_move_changed(&moved) {
-        cleanup_spawn(&new_pane, &control);
-        return Err("preview tab failed to open".into());
-    }
-    let tab_id = ipc::call_text("pane.list", serde_json::json!({}))
-        .map(|list| crate::launch::tab_of(&list, &new_pane))
-        .unwrap_or_default();
-    if tab_id.is_empty() {
-        cleanup_spawn(&new_pane, &control);
-        return Err("preview tab opened without a tab id".into());
-    }
+    let (new_pane, tab_id, control) = create_viewer_tab(my_pane_id, spawn_cwd, doc_key, payload)?;
     if !mark_dedicated_preview(&new_pane) {
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview tab could not record ownership".into());
@@ -1814,6 +2296,9 @@ fn spawn_preview_tab(
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview process failed to start".into());
     }
+    // Bring the client along. `tab.create` ran with `focus: false` so this
+    // is a real focus transition — the only kind a 0.9 client follows.
+    focus_tab_for_client(&tab_id, Some(&new_pane));
     Ok(PreviewTarget {
         pane_id: new_pane,
         tab_id,
@@ -2200,8 +2685,6 @@ fn spawn_viewer_pane(
     inline: Option<InlineSpawn>,
 ) -> Result<(String, PathBuf), String> {
     let control = fresh_control_path();
-    let doc_token = document_token(doc_key);
-    let control_token = control_token(&control);
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let plan = match inline {
@@ -2216,7 +2699,11 @@ fn spawn_viewer_pane(
                 .as_deref()
                 .and_then(|json| side_neighbor(json, my_pane_id, false));
             match neighbor {
-                Some(target) => SplitPlan { target, ratio: 0.5, swap: true },
+                Some(target) => SplitPlan {
+                    target,
+                    ratio: 0.5,
+                    swap: true,
+                },
                 None => SplitPlan {
                     target: my_pane_id.to_string(),
                     ratio: 0.3,
@@ -2253,12 +2740,69 @@ fn spawn_viewer_pane(
         cleanup_spawn(&new_pane, &control);
         return Err("preview pane could not be positioned".into());
     }
+    register_viewer_pane(&new_pane, &control, doc_key, inline.is_some())?;
+    Ok((new_pane, control))
+}
+
+/// Spawn the viewer's shell pane as the ROOT pane of a brand-new tab. This is
+/// the tab-placement counterpart of `spawn_viewer_pane`: nothing is split into
+/// the origin tab and nothing is moved out of it again, so the tab the user
+/// clicked from never changes shape (herdr 0.9 clients redraw those two
+/// layout changes as a visible flicker, and re-fit lazily). `tab.create`
+/// takes the same cwd/env as `pane.split`, so the root pane is driven exactly
+/// like a split one; `focus: false` keeps the later `pane.focus` a real
+/// transition. Returns (pane_id, tab_id, control).
+fn create_viewer_tab(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+) -> Result<(String, String, PathBuf), String> {
+    let control = fresh_control_path();
+    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
+    let workspace_id = ipc::call_text("pane.list", serde_json::json!({}))
+        .map(|list| crate::launch::workspace_of(&list, my_pane_id))
+        .unwrap_or_default();
+    let mut params = serde_json::json!({
+        "label": tab_label(doc_key, false),
+        "focus": false,
+        "cwd": spawn_cwd.display().to_string(),
+        "env": preview_spawn_env(&control, false),
+    });
+    if !workspace_id.is_empty() {
+        params["workspace_id"] = serde_json::Value::String(workspace_id);
+    }
+    let response = ipc::call_text("tab.create", params).ok();
+    let Some((tab_id, new_pane)) = response
+        .as_deref()
+        .and_then(crate::launch::created_tab_root_pane)
+    else {
+        let _ = std::fs::remove_file(&control);
+        return Err("preview tab failed to open".into());
+    };
+    if let Err(error) = register_viewer_pane(&new_pane, &control, doc_key, false) {
+        let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": tab_id }));
+        return Err(error);
+    }
+    Ok((new_pane, tab_id, control))
+}
+
+/// Stamp a freshly spawned shell pane as ours: the document/control tokens
+/// the sidebar routes clicks by, plus the "Preview" label. Closes the pane
+/// (and drops the control file) when the stamp does not land, so an unowned
+/// shell never lingers.
+fn register_viewer_pane(
+    new_pane: &str,
+    control: &Path,
+    doc_key: &str,
+    inline: bool,
+) -> Result<(), String> {
     let mut tokens = serde_json::json!({
         METADATA_SOURCE: crate::state::unix_now().to_string(),
-        TOKEN_PATH: doc_token,
-        TOKEN_CONTROL: control_token,
+        TOKEN_PATH: document_token(doc_key),
+        TOKEN_CONTROL: control_token(control),
     });
-    if inline.is_some() {
+    if inline {
         tokens[TOKEN_INLINE] = serde_json::Value::String("1".into());
     }
     if !ipc::call_text(
@@ -2271,14 +2815,14 @@ fn spawn_viewer_pane(
     )
     .is_ok_and(|response| ipc_succeeded(&response))
     {
-        cleanup_spawn(&new_pane, &control);
+        cleanup_spawn(new_pane, control);
         return Err("preview pane could not be identified".into());
     }
     let _ = ipc::call_text(
         "pane.rename",
         serde_json::json!({ "pane_id": new_pane, "label": "Preview" }),
     );
-    Ok((new_pane, control))
+    Ok(())
 }
 
 fn start_viewer_pane(pane_id: &str) -> bool {
@@ -2317,19 +2861,6 @@ fn cleanup_moved_spawn(pane_id: &str, tab_id: &str, control: &Path) {
     } else {
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
-}
-
-fn pane_move_changed(response: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(crate::launch::strip_bom(response))
-        .ok()
-        .and_then(|value| {
-            value
-                .get("result")?
-                .get("move_result")?
-                .get("changed")?
-                .as_bool()
-        })
-        .unwrap_or(false)
 }
 
 fn ipc_succeeded(response: &str) -> bool {
@@ -2381,7 +2912,11 @@ fn inline_split_plan(layout_json: &str, pane_id: &str, inline: InlineSpawn) -> O
         // `ratio` is the ORIGINAL pane's share, and a swap moves us into the
         // other slot — so keeping the sidebar's share means asking for its
         // complement when we are about to swap.
-        ratio: if inline.dock_right { 1.0 - share } else { share },
+        ratio: if inline.dock_right {
+            1.0 - share
+        } else {
+            share
+        },
         swap: inline.dock_right,
     })
 }
@@ -2465,6 +3000,7 @@ mod tests {
             context: String::new(),
             lines,
             numbered,
+            media: None,
             scroll: 0,
             wrap: true,
             rows: Vec::new(),
@@ -2481,11 +3017,103 @@ mod tests {
     }
 
     #[test]
+    fn raster_media_uses_two_truecolor_pixels_per_cell() {
+        let mut pixels = image::RgbaImage::new(2, 2);
+        for x in 0..2 {
+            pixels.put_pixel(x, 0, image::Rgba([255, 0, 0, 255]));
+            pixels.put_pixel(x, 1, image::Rgba([0, 0, 255, 255]));
+        }
+        let rows = render_media_rows(
+            &MediaPreview {
+                pixels,
+                source_width: 2,
+                source_height: 2,
+                video_poster: false,
+            },
+            2,
+            1,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_texts(&rows), vec!["▀▀"]);
+        for span in &rows[0].line.spans {
+            assert_eq!(span.style.fg, Some(Color::Rgb(255, 0, 0)));
+            assert_eq!(span.style.bg, Some(Color::Rgb(0, 0, 255)));
+        }
+    }
+
+    #[test]
+    fn media_extensions_are_case_insensitive_and_disjoint() {
+        assert!(is_image_file(Path::new("photo.JPEG")));
+        assert!(is_video_file(Path::new("clip.MP4")));
+        assert!(!is_video_file(Path::new("photo.png")));
+        assert!(!is_image_file(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn image_files_decode_into_media_and_oversized_inputs_stop_before_decode() {
+        let root = std::env::temp_dir().join(format!("viewer-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let image_path = root.join("sample.png");
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([12, 34, 56, 255]))
+            .save_with_format(&image_path, image::ImageFormat::Png)
+            .unwrap();
+        let doc = load_file(&image_path, None);
+        assert!(doc.media.is_some());
+        assert!(doc.lines.is_empty());
+
+        let oversized = root.join("oversized.png");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_MEDIA_FILE_BYTES + 1)
+            .unwrap();
+        assert!(
+            decode_image_file(&oversized)
+                .unwrap_err()
+                .contains("MiB limit")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ffmpeg_lookup_skips_project_local_path_entries() {
+        let root = std::env::temp_dir().join(format!("viewer-ffmpeg-{}", std::process::id()));
+        let project = root.join("project");
+        let local_bin = project.join("tools");
+        let external_bin = root.join("external");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::create_dir_all(&external_bin).unwrap();
+        let executable = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        for directory in [&local_bin, &external_bin] {
+            let file = directory.join(executable);
+            std::fs::write(&file, b"placeholder").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let search_path = std::env::join_paths([&local_bin, &external_bin]).unwrap();
+        let project = project.canonicalize().unwrap();
+        assert_eq!(
+            ffmpeg_in_path(&search_path, Some(&project)),
+            Some(external_bin.canonicalize().unwrap().join(executable))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn wrapping_makes_every_continuation_row_scrollable() {
         // One source line, four rows' worth of text in a 10-wide pane.
         let long = "alpha beta gamma delta epsilon zeta";
         let mut doc = doc_of(vec![Line::raw(long), Line::raw("tail")], false);
-        doc.relayout(10);
+        doc.relayout(10, 20);
         assert!(doc.rows.len() > 2, "the long line must occupy several rows");
         // Every row belongs to a source line, in order, and the last row is
         // reachable by scrolling — which the pre-fix source-line scroll
@@ -2503,7 +3131,7 @@ mod tests {
     fn wrap_off_keeps_one_row_per_source_line() {
         let mut doc = doc_of(vec![Line::raw("a".repeat(120)), Line::raw("b")], false);
         doc.wrap = false;
-        doc.relayout(20);
+        doc.relayout(20, 20);
         assert_eq!(doc.rows.len(), 2);
         assert_eq!(
             doc.rows.iter().map(|r| r.src).collect::<Vec<_>>(),
@@ -2517,7 +3145,7 @@ mod tests {
             vec![Line::raw("one two three four five six"), Line::raw("x")],
             true,
         );
-        doc.relayout(14);
+        doc.relayout(14, 20);
         let texts = row_texts(&doc.rows);
         assert!(texts[0].starts_with("1 "), "{texts:?}");
         // A continuation indents to the number column instead of renumbering.
@@ -2531,7 +3159,7 @@ mod tests {
     #[test]
     fn preview_selection_copies_text_without_line_numbers() {
         let mut doc = doc_of(vec![Line::raw("alpha beta"), Line::raw("gamma")], true);
-        doc.relayout(40);
+        doc.relayout(40, 20);
         doc.selection.anchor = Some(RenderPos { row: 0, col: 1 });
         doc.selection.cursor = Some(RenderPos { row: 1, col: 2 });
         assert_eq!(doc.selected_text().as_deref(), Some("lpha beta\nga"));
@@ -2540,7 +3168,7 @@ mod tests {
     #[test]
     fn preview_selection_does_not_copy_visual_wrap_breaks() {
         let mut doc = doc_of(vec![Line::raw("alpha beta")], false);
-        doc.relayout(6);
+        doc.relayout(6, 20);
         assert_eq!(doc.rows.len(), 2);
         let last_col = row_text_without_gutter(doc.rows.last().unwrap(), 0)
             .chars()
@@ -2556,7 +3184,7 @@ mod tests {
     #[test]
     fn unchanged_diff_refresh_preserves_selection_and_layout() {
         let mut doc = doc_of(vec![Line::raw("-old"), Line::raw("+new")], false);
-        doc.relayout(40);
+        doc.relayout(40, 20);
         doc.scroll = 1;
         doc.selection.anchor = Some(RenderPos { row: 0, col: 1 });
         doc.selection.cursor = Some(RenderPos { row: 1, col: 3 });
@@ -2596,7 +3224,7 @@ mod tests {
             vec![Line::raw("+ a long added line of code here").on_green()],
             false,
         );
-        doc.relayout(12);
+        doc.relayout(12, 20);
         assert!(doc.rows.len() > 1);
         for row in &doc.rows {
             assert_eq!(row.line.style.bg, Some(Color::Green));
@@ -2611,20 +3239,20 @@ mod tests {
             .map(|n| Line::raw(format!("line {n} with a good deal of text on it")))
             .collect();
         let mut doc = doc_of(lines, false);
-        doc.relayout(12);
+        doc.relayout(12, 20);
         // Scroll to the first row of source line 3.
         doc.scroll = doc.rows.iter().position(|r| r.src == 3).unwrap();
         assert_eq!(doc.top_src(), 3);
 
         doc.pending_src = Some(doc.top_src());
         doc.wrap = false;
-        doc.relayout(12);
+        doc.relayout(12, 20);
         assert_eq!(doc.scroll, 3, "unwrapped rows are 1:1 with source lines");
         assert_eq!(doc.top_src(), 3);
 
         doc.pending_src = Some(doc.top_src());
         doc.wrap = true;
-        doc.relayout(12);
+        doc.relayout(12, 20);
         assert_eq!(doc.top_src(), 3, "and back, still on the same source line");
     }
 
@@ -2712,11 +3340,11 @@ mod tests {
             vec![Line::raw("wrap me around a narrow pane please")],
             false,
         );
-        doc.relayout(10);
+        doc.relayout(10, 20);
         let narrow = doc.rows.len();
-        doc.relayout(10);
+        doc.relayout(10, 20);
         assert_eq!(doc.rows.len(), narrow, "same key: no rebuild, no change");
-        doc.relayout(40);
+        doc.relayout(40, 20);
         assert!(doc.rows.len() < narrow, "a wider pane needs fewer rows");
     }
 
@@ -2843,7 +3471,10 @@ mod tests {
             .filter(|p| p.workspace_id == "wB")
             .cloned()
             .collect();
-        assert_eq!(reusable_preview(&learnings, false).unwrap().pane_id, "wB:pE");
+        assert_eq!(
+            reusable_preview(&learnings, false).unwrap().pane_id,
+            "wB:pE"
+        );
 
         // Matching an already-open document is scoped too: jumping to another
         // workspace's tab is the same teleport by a different route.
@@ -2900,10 +3531,7 @@ mod tests {
     #[test]
     fn ephemeral_previews_preserve_the_original_return_tab() {
         let mut previews = previews_in(PREVIEWS);
-        let ephemeral = previews
-            .iter_mut()
-            .find(|preview| !preview.pinned)
-            .unwrap();
+        let ephemeral = previews.iter_mut().find(|preview| !preview.pinned).unwrap();
         ephemeral.origin_tab_id = "w4:t1".into();
         assert_eq!(preview_origin_tab(&previews, "w4:t3"), "w4:t1");
         assert_eq!(preview_origin_tab(&previews, "w4:t2"), "w4:t2");
@@ -2943,22 +3571,42 @@ mod tests {
         let left = inline_split_plan(
             &layout(SIDEBAR_LEFT),
             "w1:p1",
-            InlineSpawn { dock_right: false, sidebar_cols: 32 },
+            InlineSpawn {
+                dock_right: false,
+                sidebar_cols: 32,
+            },
         )
         .unwrap();
         // Split only goes right, so the neighbour is halved and the fresh
         // pane swapped into the half nearest us.
-        assert_eq!(left, SplitPlan { target: "w1:p2".into(), ratio: 0.5, swap: true });
+        assert_eq!(
+            left,
+            SplitPlan {
+                target: "w1:p2".into(),
+                ratio: 0.5,
+                swap: true
+            }
+        );
 
         let right = inline_split_plan(
             &layout(SIDEBAR_RIGHT),
             "w1:p1",
-            InlineSpawn { dock_right: true, sidebar_cols: 32 },
+            InlineSpawn {
+                dock_right: true,
+                sidebar_cols: 32,
+            },
         )
         .unwrap();
         // Splitting the LEFT neighbour rightwards already lands the new pane
         // between it and the sidebar — no swap needed.
-        assert_eq!(right, SplitPlan { target: "w1:p2".into(), ratio: 0.5, swap: false });
+        assert_eq!(
+            right,
+            SplitPlan {
+                target: "w1:p2".into(),
+                ratio: 0.5,
+                swap: false
+            }
+        );
     }
 
     /// A tab whose only pane is the sidebar: we give away everything past our
@@ -2969,7 +3617,10 @@ mod tests {
         let left = inline_split_plan(
             &alone,
             "w1:p1",
-            InlineSpawn { dock_right: false, sidebar_cols: 32 },
+            InlineSpawn {
+                dock_right: false,
+                sidebar_cols: 32,
+            },
         )
         .unwrap();
         assert_eq!(left.target, "w1:p1");
@@ -2981,7 +3632,10 @@ mod tests {
         let right = inline_split_plan(
             &alone,
             "w1:p1",
-            InlineSpawn { dock_right: true, sidebar_cols: 32 },
+            InlineSpawn {
+                dock_right: true,
+                sidebar_cols: 32,
+            },
         )
         .unwrap();
         assert!(right.swap);
@@ -2992,7 +3646,10 @@ mod tests {
         let clamped = inline_split_plan(
             &narrow,
             "w1:p1",
-            InlineSpawn { dock_right: false, sidebar_cols: 80 },
+            InlineSpawn {
+                dock_right: false,
+                sidebar_cols: 80,
+            },
         )
         .unwrap();
         assert!((clamped.ratio - 0.5).abs() < 1e-9, "{}", clamped.ratio);
@@ -3002,20 +3659,34 @@ mod tests {
     fn fallback_plan_mirrors_a_right_docked_sidebar() {
         let left = fallback_inline_split_plan(
             "w1:p1",
-            InlineSpawn { dock_right: false, sidebar_cols: 32 },
+            InlineSpawn {
+                dock_right: false,
+                sidebar_cols: 32,
+            },
         );
         assert_eq!(
             left,
-            SplitPlan { target: "w1:p1".into(), ratio: 0.3, swap: false }
+            SplitPlan {
+                target: "w1:p1".into(),
+                ratio: 0.3,
+                swap: false
+            }
         );
 
         let right = fallback_inline_split_plan(
             "w1:p1",
-            InlineSpawn { dock_right: true, sidebar_cols: 32 },
+            InlineSpawn {
+                dock_right: true,
+                sidebar_cols: 32,
+            },
         );
         assert_eq!(
             right,
-            SplitPlan { target: "w1:p1".into(), ratio: 0.7, swap: true }
+            SplitPlan {
+                target: "w1:p1".into(),
+                ratio: 0.7,
+                swap: true
+            }
         );
     }
 
@@ -3025,17 +3696,24 @@ mod tests {
             inline_split_plan(
                 "not json",
                 "w1:p1",
-                InlineSpawn { dock_right: false, sidebar_cols: 32 }
+                InlineSpawn {
+                    dock_right: false,
+                    sidebar_cols: 32
+                }
             )
             .is_none()
         );
         // Zero-width rects would divide by nothing.
-        let degenerate = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":0,"height":50}}"#);
+        let degenerate =
+            layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":0,"height":50}}"#);
         assert!(
             inline_split_plan(
                 &degenerate,
                 "w1:p1",
-                InlineSpawn { dock_right: false, sidebar_cols: 32 }
+                InlineSpawn {
+                    dock_right: false,
+                    sidebar_cols: 32
+                }
             )
             .is_none()
         );
@@ -3053,7 +3731,10 @@ mod tests {
         ]}}"#;
         let previews = previews_in(pinned);
         assert!(previews[0].inline);
-        assert!(!previews[0].dedicated, "an inline viewer never owns its tab");
+        assert!(
+            !previews[0].dedicated,
+            "an inline viewer never owns its tab"
+        );
         assert!(reusable_preview(&previews, true).is_some());
         assert!(reusable_preview(&previews, false).is_none());
     }
@@ -3101,7 +3782,7 @@ mod tests {
         let mut bytes = vec![b'a'; 9000];
         bytes.push(0);
         std::fs::write(&path, bytes).unwrap();
-        let doc = load_file(&path);
+        let doc = load_file(&path, None);
         let rendered: String = doc.lines[0]
             .spans
             .iter()
@@ -3196,12 +3877,23 @@ mod tests {
     }
 
     #[test]
-    fn pane_move_requires_a_changed_success_result() {
-        let moved = r#"{"result":{"type":"pane_move","move_result":{"changed":true}}}"#;
-        let refused = r#"{"result":{"type":"pane_move","move_result":{"changed":false}}}"#;
-        assert!(pane_move_changed(moved));
-        assert!(!pane_move_changed(refused));
-        assert!(!pane_move_changed(r#"{"error":{"message":"nope"}}"#));
+    fn tab_create_yields_tab_and_root_pane_or_nothing() {
+        use crate::launch::created_tab_root_pane;
+        let created = r#"{"result":{"type":"tab_created","tab":{"tab_id":"w9:tX","label":"x · preview"},"root_pane":{"pane_id":"w9:p1E","tab_id":"w9:tX"}}}"#;
+        assert_eq!(
+            created_tab_root_pane(created),
+            Some(("w9:tX".into(), "w9:p1E".into()))
+        );
+        // A tab without a pane id is unusable as a viewer; so is an error.
+        let no_pane = r#"{"result":{"type":"tab_created","tab":{"tab_id":"w9:tX"}}}"#;
+        assert_eq!(created_tab_root_pane(no_pane), None);
+        assert_eq!(
+            created_tab_root_pane(r#"{"error":{"message":"nope"}}"#),
+            None
+        );
+        // Ids that could be mistaken for CLI flags are rejected like everywhere else.
+        let flaggy = r#"{"result":{"tab":{"tab_id":"--tab"},"root_pane":{"pane_id":"w9:p1"}}}"#;
+        assert_eq!(created_tab_root_pane(flaggy), None);
     }
 
     #[cfg(unix)]
@@ -3254,7 +3946,18 @@ mod tests {
         let f = file_request(Path::new("C:/x/y.rs"));
         assert_eq!(
             parse_request(&f),
-            Some(Request::File(PathBuf::from("C:/x/y.rs")))
+            Some(Request::File {
+                path: PathBuf::from("C:/x/y.rs"),
+                line: None,
+            })
+        );
+        let f = file_request_at(Path::new("C:/x/y.rs"), 42);
+        assert_eq!(
+            parse_request(&f),
+            Some(Request::File {
+                path: PathBuf::from("C:/x/y.rs"),
+                line: Some(42),
+            })
         );
         let s = show_request(Path::new("C:/repo"), "stash@{1}", None);
         assert_eq!(
@@ -3286,9 +3989,31 @@ mod tests {
         // Legacy bare path still works.
         assert_eq!(
             parse_request("C:/plain.txt"),
-            Some(Request::File(PathBuf::from("C:/plain.txt")))
+            Some(Request::File {
+                path: PathBuf::from("C:/plain.txt"),
+                line: None,
+            })
         );
         assert_eq!(parse_request("  "), None);
+    }
+
+    #[test]
+    fn line_target_anchors_plain_and_markdown_source_previews() {
+        let root =
+            std::env::temp_dir().join(format!("herdr-sidebar-line-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["sample.txt", "sample.md"] {
+            let path = root.join(name);
+            std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+            let doc = load_file(&path, Some(2));
+            assert_eq!(doc.pending_src, Some(1));
+            assert!(
+                doc.numbered,
+                "line-target markdown must keep source mapping"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

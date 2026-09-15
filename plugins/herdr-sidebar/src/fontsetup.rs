@@ -42,7 +42,9 @@ pub const MANUAL_CMD: &str = "curl -fsSL https://github.com/ryanoasis/nerd-fonts
 /// Testing/ops hook: `force` shows the prompt regardless of probe and flag;
 /// `off` suppresses it entirely.
 fn env_mode() -> Option<String> {
-    std::env::var("HERDR_SIDEBAR_FONT_PROMPT").ok().map(|v| v.trim().to_lowercase())
+    std::env::var("HERDR_SIDEBAR_FONT_PROMPT")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
 }
 
 /// Show the prompt if this looks like a first run on a machine without a
@@ -84,13 +86,23 @@ struct Heartbeat {
 
 impl Heartbeat {
     fn new(view: View, merged: bool) -> Self {
-        let pane_id = std::env::var("HERDR_PANE_ID").ok().filter(|id| !id.is_empty());
-        Self { pane_id, view, merged, last: None }
+        let pane_id = std::env::var("HERDR_PANE_ID")
+            .ok()
+            .filter(|id| !id.is_empty());
+        Self {
+            pane_id,
+            view,
+            merged,
+            last: None,
+        }
     }
 
     fn beat(&mut self) {
         let Some(pane_id) = &self.pane_id else { return };
-        if self.last.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) {
+        if self
+            .last
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
             return;
         }
         self.last = Some(Instant::now());
@@ -140,7 +152,11 @@ fn run(
                         // like any machine that already had a Nerd Font.
                         st.icons = Some(icons::IconTheme::Material);
                     }
-                    screen = Screen::Done { result, probe_ok, copied: false };
+                    screen = Screen::Done {
+                        result,
+                        probe_ok,
+                        copied: false,
+                    };
                 }
                 Err(_) => {}
             }
@@ -148,7 +164,9 @@ fn run(
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -160,7 +178,11 @@ fn run(
                         let result = install(&tx);
                         let _ = tx.send(Progress::Done(result));
                     });
-                    screen = Screen::Installing { rx, step: "Starting…", started: Instant::now() };
+                    screen = Screen::Installing {
+                        rx,
+                        step: "Starting…",
+                        started: Instant::now(),
+                    };
                 }
                 // Only an explicit decline answers "no" — a stray arrow key
                 // must not silently commit the user to emoji icons.
@@ -207,8 +229,16 @@ fn draw(frame: &mut Frame, screen: &Screen) {
         Screen::Installing { step, started, .. } => {
             installing_lines(step, started.elapsed(), inner_w, max_h)
         }
-        Screen::Done { result: Ok(()), probe_ok, .. } => done_ok_lines(*probe_ok, inner_w, max_h),
-        Screen::Done { result: Err(e), copied, .. } => done_err_lines(e, *copied, inner_w, max_h),
+        Screen::Done {
+            result: Ok(()),
+            probe_ok,
+            ..
+        } => done_ok_lines(*probe_ok, inner_w, max_h),
+        Screen::Done {
+            result: Err(e),
+            copied,
+            ..
+        } => done_err_lines(e, *copied, inner_w, max_h),
     };
     // A breathing row under the border when there's room for one.
     if lines.len() < max_h {
@@ -275,7 +305,9 @@ fn fit_blocks(blocks: Vec<(u8, Vec<Line<'static>>)>, height: usize) -> Vec<Line<
             .iter()
             .zip(kept)
             .filter(|(_, k)| **k)
-            .fold((0usize, 0usize), |(s, n), ((_, lines), _)| (s + lines.len(), n + 1));
+            .fold((0usize, 0usize), |(s, n), ((_, lines), _)| {
+                (s + lines.len(), n + 1)
+            });
         sum + n.saturating_sub(1)
     };
     while total(&kept) > height && kept.iter().filter(|&&k| k).count() > 1 {
@@ -305,12 +337,19 @@ fn ask_lines(width: u16, height: usize) -> Vec<Line<'static>> {
     // Below ~40 cols the full label wraps; a compact one keeps each option
     // on a single line far longer, which is what buys the options room in
     // exactly the panes that clip.
-    let yes = if width >= 40 { "Download and install (Recommended)" } else { "Install (Recommended)" };
+    let yes = if width >= 40 {
+        "Download and install (Recommended)"
+    } else {
+        "Install (Recommended)"
+    };
     let mut options = option_lines("Y", yes, width);
     options.extend(option_lines("N", "Use emoji icons", width));
     fit_blocks(
         vec![
-            (3, wrapped("No Nerd Font detected", width, Style::default().bold())),
+            (
+                3,
+                wrapped("No Nerd Font detected", width, Style::default().bold()),
+            ),
             (
                 0,
                 wrapped(
@@ -320,23 +359,49 @@ fn ask_lines(width: u16, height: usize) -> Vec<Line<'static>> {
                     Style::default(),
                 ),
             ),
-            (1, wrapped(&format!("Download and install {FONT_NAME} now?"), width, Style::default())),
+            (
+                1,
+                wrapped(
+                    &format!("Download and install {FONT_NAME} now?"),
+                    width,
+                    Style::default(),
+                ),
+            ),
             (4, options),
-            (2, wrapped("Enter also installs", width, Style::default().dim())),
+            (
+                2,
+                wrapped("Enter also installs", width, Style::default().dim()),
+            ),
         ],
         height,
     )
 }
 
-fn installing_lines(step: &str, elapsed: Duration, width: u16, height: usize) -> Vec<Line<'static>> {
+fn installing_lines(
+    step: &str,
+    elapsed: Duration,
+    width: u16,
+    height: usize,
+) -> Vec<Line<'static>> {
     let spin = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
     fit_blocks(
         vec![
             (
                 4,
-                wrapped(&format!("{spin} Installing {FONT_NAME}…"), width, Style::default().bold()),
+                wrapped(
+                    &format!("{spin} Installing {FONT_NAME}…"),
+                    width,
+                    Style::default().bold(),
+                ),
             ),
-            (3, wrapped(&format!("{step} ({}s)", elapsed.as_secs()), width, Style::default())),
+            (
+                3,
+                wrapped(
+                    &format!("{step} ({}s)", elapsed.as_secs()),
+                    width,
+                    Style::default(),
+                ),
+            ),
             (
                 0,
                 wrapped(
@@ -345,7 +410,10 @@ fn installing_lines(step: &str, elapsed: Duration, width: u16, height: usize) ->
                     Style::default().dim(),
                 ),
             ),
-            (5, option_lines("Esc", "stop waiting — use emoji icons for now", width)),
+            (
+                5,
+                option_lines("Esc", "stop waiting — use emoji icons for now", width),
+            ),
         ],
         height,
     )
@@ -407,7 +475,11 @@ fn done_ok_lines(probe_ok: bool, width: u16, height: usize) -> Vec<Line<'static>
 fn done_err_lines(err: &str, copied: bool, width: u16, height: usize) -> Vec<Line<'static>> {
     let mut options = option_lines(
         "C",
-        if copied { "copy the command — copied ✓" } else { "copy the command" },
+        if copied {
+            "copy the command — copied ✓"
+        } else {
+            "copy the command"
+        },
         width,
     );
     options.extend(option_lines("⏎", "continue with emoji icons", width));
@@ -445,7 +517,10 @@ fn run_step(prog: &str, args: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("{prog} failed: {}", err.lines().next().unwrap_or("(no output)").trim()))
+        Err(format!(
+            "{prog} failed: {}",
+            err.lines().next().unwrap_or("(no output)").trim()
+        ))
     }
 }
 
@@ -453,7 +528,9 @@ fn run_step(prog: &str, args: &[&str]) -> Result<(), String> {
 /// `HERDR_SIDEBAR_FONT_INSTALL=fail|ok` short-circuits the installer.
 fn simulated() -> Option<Result<(), String>> {
     match std::env::var("HERDR_SIDEBAR_FONT_INSTALL").ok()?.as_str() {
-        "fail" => Some(Err("simulated failure (HERDR_SIDEBAR_FONT_INSTALL=fail)".into())),
+        "fail" => Some(Err(
+            "simulated failure (HERDR_SIDEBAR_FONT_INSTALL=fail)".into()
+        )),
         "ok" => Some(Ok(())),
         _ => None,
     }
@@ -493,23 +570,40 @@ fn install(tx: &Sender<Progress>) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     let zip = tmp.join("font.zip");
-    run_step("curl", &["-fsSL", ZIP_URL, "-o", &zip.display().to_string()])?;
+    run_step(
+        "curl",
+        &["-fsSL", ZIP_URL, "-o", &zip.display().to_string()],
+    )?;
     step("Unpacking…");
-    run_step("tar", &["-xf", &zip.display().to_string(), "-C", &tmp.display().to_string()])?;
+    run_step(
+        "tar",
+        &[
+            "-xf",
+            &zip.display().to_string(),
+            "-C",
+            &tmp.display().to_string(),
+        ],
+    )?;
 
     step("Registering fonts for your user…");
-    let fonts_dir = std::path::PathBuf::from(
-        std::env::var("LOCALAPPDATA").map_err(|e| e.to_string())?,
-    )
-    .join(r"Microsoft\Windows\Fonts");
+    let fonts_dir =
+        std::path::PathBuf::from(std::env::var("LOCALAPPDATA").map_err(|e| e.to_string())?)
+            .join(r"Microsoft\Windows\Fonts");
     std::fs::create_dir_all(&fonts_dir).map_err(|e| e.to_string())?;
     let mut installed = 0usize;
-    for entry in std::fs::read_dir(&tmp).map_err(|e| e.to_string())?.flatten() {
+    for entry in std::fs::read_dir(&tmp)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("ttf") {
             continue;
         }
-        let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let dest = fonts_dir.join(path.file_name().unwrap_or_default());
         std::fs::copy(&path, &dest).map_err(|e| e.to_string())?;
         run_step(
@@ -556,11 +650,19 @@ fn install(tx: &Sender<Progress>) -> Result<(), String> {
     std::fs::create_dir_all(&fonts_dir).map_err(|e| e.to_string())?;
     step("Downloading the font archive…");
     let zip = std::env::temp_dir().join("herdr-sidebar-font.zip");
-    run_step("curl", &["-fsSL", ZIP_URL, "-o", &zip.display().to_string()])?;
+    run_step(
+        "curl",
+        &["-fsSL", ZIP_URL, "-o", &zip.display().to_string()],
+    )?;
     step("Unpacking into your font directory…");
     run_step(
         "unzip",
-        &["-o", &zip.display().to_string(), "-d", &fonts_dir.display().to_string()],
+        &[
+            "-o",
+            &zip.display().to_string(),
+            "-d",
+            &fonts_dir.display().to_string(),
+        ],
     )?;
     let _ = std::fs::remove_file(&zip);
     #[cfg(not(target_os = "macos"))]
@@ -578,7 +680,12 @@ mod tests {
     fn text_of(lines: &[Line<'_>]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -589,7 +696,10 @@ mod tests {
 
     /// Words survive wrapping: joining on whitespace recovers the copy.
     fn squashed(lines: &[Line<'_>]) -> String {
-        text_of(lines).split_whitespace().collect::<Vec<_>>().join(" ")
+        text_of(lines)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -597,8 +707,16 @@ mod tests {
         // The bug report: a ~30-col pane clipped the Y/N options entirely.
         // 30x12 pane → 28 inner cols, 10 inner rows.
         let lines = ask_lines(28, 10);
-        assert!(lines.len() <= 10, "must fit the pane height: {}", lines.len());
-        assert!(max_width(&lines) <= 28, "no line may exceed the pane: {:?}", text_of(&lines));
+        assert!(
+            lines.len() <= 10,
+            "must fit the pane height: {}",
+            lines.len()
+        );
+        assert!(
+            max_width(&lines) <= 28,
+            "no line may exceed the pane: {:?}",
+            text_of(&lines)
+        );
         let text = squashed(&lines);
         assert!(text.contains("Download and install"), "{text}");
         assert!(text.contains("Use emoji icons"), "{text}");
@@ -624,18 +742,32 @@ mod tests {
         let lines = ask_lines(64, 30);
         let text = squashed(&lines);
         assert!(text.contains("No Nerd Font detected"), "{text}");
-        assert!(text.contains("material icon theme"), "explanation shown: {text}");
-        assert!(text.contains(&format!("Download and install {FONT_NAME} now?")), "{text}");
+        assert!(
+            text.contains("material icon theme"),
+            "explanation shown: {text}"
+        );
+        assert!(
+            text.contains(&format!("Download and install {FONT_NAME} now?")),
+            "{text}"
+        );
         assert!(text.contains("Enter also installs"), "{text}");
     }
 
     #[test]
     fn fit_blocks_drops_lowest_priority_first() {
         let block = |p: u8, n: usize, tag: &str| {
-            (p, (0..n).map(|i| Line::from(format!("{tag}{i}"))).collect::<Vec<_>>())
+            (
+                p,
+                (0..n)
+                    .map(|i| Line::from(format!("{tag}{i}")))
+                    .collect::<Vec<_>>(),
+            )
         };
         // 3+1+3+1+3 = 11 lines total; at height 7 exactly one block must go.
-        let fitted = fit_blocks(vec![block(2, 3, "a"), block(0, 3, "b"), block(1, 3, "c")], 7);
+        let fitted = fit_blocks(
+            vec![block(2, 3, "a"), block(0, 3, "b"), block(1, 3, "c")],
+            7,
+        );
         let text = text_of(&fitted);
         assert!(text.contains("a0") && text.contains("c0"), "{text}");
         assert!(!text.contains("b0"), "lowest priority dropped: {text}");
@@ -666,11 +798,19 @@ mod tests {
 
     #[test]
     fn failure_screen_keeps_actions_when_narrow() {
-        let lines = done_err_lines("some very long error message from the installer", false, 26, 8);
+        let lines = done_err_lines(
+            "some very long error message from the installer",
+            false,
+            26,
+            8,
+        );
         assert!(lines.len() <= 8, "{}", text_of(&lines));
         assert!(max_width(&lines) <= 26, "{:?}", text_of(&lines));
         let text = squashed(&lines);
-        assert!(text.contains("copy the command"), "actions never drop: {text}");
+        assert!(
+            text.contains("copy the command"),
+            "actions never drop: {text}"
+        );
     }
 
     #[test]
@@ -679,8 +819,14 @@ mod tests {
         let text = squashed(&lines);
         assert!(text.contains("ACTIVE font"), "{text}");
         assert!(text.contains(FONT_NAME), "{text}");
-        assert!(text.contains("does not change the terminal's profile"), "{text}");
-        assert!(!text.contains("probe can't see it"), "no probe note when probe passed");
+        assert!(
+            text.contains("does not change the terminal's profile"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("probe can't see it"),
+            "no probe note when probe passed"
+        );
         let unprobed = squashed(&done_ok_lines(false, 60, 24));
         assert!(unprobed.contains("probe can't see it yet"), "{unprobed}");
     }

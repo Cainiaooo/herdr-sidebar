@@ -4,8 +4,13 @@
 //! so the repo-relative paths porcelain reports resolve even when the pane's
 //! cwd is a subdirectory.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+const IGNORED_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One file in the staged or unstaged list.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +39,13 @@ pub struct Status {
 #[derive(Clone)]
 pub struct Git {
     root: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    pub current: bool,
+    pub remote: bool,
 }
 
 /// What one [`Git::stage_under`] call did: how many paths it staged, and how
@@ -132,7 +144,7 @@ impl Git {
     }
 
     pub fn status(&self) -> Result<Status, String> {
-        let out = run_in(
+        let out = run_read_in(
             &self.root,
             &[
                 "status",
@@ -207,6 +219,13 @@ impl Git {
         if entry.letter == 'U' {
             return run_in(&self.root, &["clean", "-fd", "--", &entry.path]).map(drop);
         }
+        if let Some(original) = entry.orig.as_deref() {
+            if entry.letter == 'R' {
+                run_in(&self.root, &["checkout", "--", original])?;
+            }
+            run_in(&self.root, &["reset", "-q", "--", &entry.path])?;
+            return run_in(&self.root, &["clean", "-fd", "--", &entry.path]).map(drop);
+        }
         run_in(&self.root, &["checkout", "--", &entry.path]).map(drop)
     }
 
@@ -249,21 +268,23 @@ impl Git {
     }
 
     /// Repo-relative roots of ignored paths, for the Explorer's `Ignored`
-    /// decoration (issue #19). Deliberately a SECOND status call with
-    /// `--untracked-files=normal`: `--ignored` combined with the `-uall` the
-    /// main [`Git::status`] call uses expands every file inside `target/` and
-    /// `node_modules/`, while `normal` keeps ignored directories collapsed to
-    /// a single `dir/` entry — one cheap line instead of tens of thousands.
+    /// decoration (issue #19). This deliberately uses a separate, bounded
+    /// `ls-files` query: `--directory` keeps wholly ignored directories
+    /// collapsed, and a shared non-blocking lock prevents preview sidebars
+    /// from multiplying an expensive scan of the same repository.
     pub fn ignored(&self) -> Result<Vec<String>, String> {
-        let out = run_in(
+        let _scan = IgnoredScanLock::acquire(&self.root)?;
+        let out = run_read_in_with_timeout(
             &self.root,
             &[
-                "status",
-                "--porcelain",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
                 "-z",
-                "--ignored=traditional",
-                "--untracked-files=normal",
             ],
+            IGNORED_SCAN_TIMEOUT,
         )?;
         Ok(parse_ignored(&out))
     }
@@ -403,6 +424,38 @@ impl Git {
         )?)
     }
 
+    /// Branches suitable for an interactive checkout picker. Symbolic remote
+    /// HEAD aliases are omitted because selecting one would create a detached
+    /// or misleading checkout target.
+    pub fn branch_choices(&self) -> Result<Vec<Branch>, String> {
+        let out = run_in(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(HEAD)%00%(refname:short)%00%(refname)%00%(symref)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+        )?;
+        Ok(parse_branch_choices(&out))
+    }
+
+    /// Checkout one picker entry. Remote refs become ordinary local tracking
+    /// branches, matching editor branch pickers rather than leaving a detached
+    /// HEAD. Dirty-worktree failures are returned unchanged; nothing is forced.
+    pub fn checkout_branch(&self, branch: &Branch) -> Result<(), String> {
+        if branch.current {
+            return Ok(());
+        }
+        let args = if branch.remote {
+            vec!["checkout", "--track", branch.name.as_str()]
+        } else {
+            vec!["checkout", branch.name.as_str()]
+        };
+        run_in(&self.root, &args).map(drop)
+    }
+
     pub fn remotes(&self) -> Result<Vec<String>, String> {
         let out = run_in(&self.root, &["remote", "-v"])?;
         // `remote -v` lists fetch and push separately; one line per remote reads better.
@@ -445,23 +498,301 @@ fn lines(out: String) -> Result<Vec<String>, String> {
 }
 
 fn run_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = git_command(dir, args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    command_result(out.status, out.stdout, out.stderr)
+}
+
+fn parse_branch_choices(out: &str) -> Vec<Branch> {
+    let mut branches: Vec<Branch> = out
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\0');
+            let current = fields.next()?.trim() == "*";
+            let name = fields.next()?.trim();
+            let full = fields.next()?.trim();
+            let symref = fields.next().unwrap_or("").trim();
+            if name.is_empty() || !symref.is_empty() {
+                return None;
+            }
+            Some(Branch {
+                name: name.to_string(),
+                current,
+                remote: full.starts_with("refs/remotes/"),
+            })
+        })
+        .collect();
+    if let Some(current) = branches.iter().position(|branch| branch.current) {
+        branches.rotate_left(current);
+    }
+    branches
+}
+
+/// Background status reads must never refresh the index while another pane or
+/// tool is trying to write it. `GIT_OPTIONAL_LOCKS=0` asks Git to skip those
+/// optional index writes without changing the result of these read-only calls.
+fn run_read_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = git_command(dir, args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    command_result(out.status, out.stdout, out.stderr)
+}
+
+fn run_read_in_with_timeout(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut command = git_command(dir, args);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepare_timed_command(&mut command);
+    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
+    let child_job = match ChildJob::attach(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let stdout = child.stdout.take().ok_or("git stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("git stderr unavailable")?;
+    let stdout_reader = std::thread::spawn(move || read_all(stdout));
+    let stderr_reader = std::thread::spawn(move || read_all(stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("git: {e}"))? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let tree_terminated = terminate_child(&mut child, child_job.as_ref());
+            let _ = child.wait();
+            if tree_terminated {
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+            } else {
+                drop(stdout_reader);
+                drop(stderr_reader);
+            }
+            return Err(format!(
+                "ignored-file scan timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "git stdout reader panicked".to_string())??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "git stderr reader panicked".to_string())??;
+    command_result(status, stdout, stderr)
+}
+
+#[cfg(windows)]
+fn prepare_timed_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+}
+
+#[cfg(not(windows))]
+fn prepare_timed_command(_command: &mut Command) {}
+
+#[cfg(windows)]
+struct ChildJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+fn resume_child(process_id: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
+    let mut found = unsafe { Thread32First(snapshot, &mut entry) != 0 };
+    while found {
+        if entry.th32OwnerProcessID == process_id {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if !thread.is_null() {
+                let resumed = unsafe { ResumeThread(thread) != u32::MAX };
+                unsafe { CloseHandle(thread) };
+                unsafe { CloseHandle(snapshot) };
+                return resumed;
+            }
+        }
+        found = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
+    }
+    unsafe { CloseHandle(snapshot) };
+    false
+}
+
+#[cfg(windows)]
+impl ChildJob {
+    fn attach(child: &Child) -> Result<Option<Self>, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err("git: could not create timeout job".to_string());
+        }
+        let assigned = unsafe { AssignProcessToJobObject(handle, child.as_raw_handle().cast()) };
+        if assigned == 0 {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err("git: could not assign timeout job".to_string());
+        }
+        let job = Self { handle };
+        if !resume_child(child.id()) {
+            job.terminate();
+            return Err("git: could not resume timeout child".to_string());
+        }
+        Ok(Some(job))
+    }
+
+    fn terminate(&self) -> bool {
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) != 0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildJob {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(not(windows))]
+struct ChildJob;
+
+#[cfg(not(windows))]
+impl ChildJob {
+    fn attach(_child: &Child) -> Result<Option<Self>, String> {
+        Ok(None)
+    }
+
+    fn terminate(&self) -> bool {
+        false
+    }
+}
+
+fn terminate_child(child: &mut Child, job: Option<&ChildJob>) -> bool {
+    if job.is_some_and(ChildJob::terminate) {
+        true
+    } else {
+        let _ = child.kill();
+        false
+    }
+}
+
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("-c")
         .arg("color.ui=false")
         .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        .current_dir(dir);
+    command
+}
+
+fn read_all(mut reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("git output: {e}"))?;
+    Ok(bytes)
+}
+
+fn command_result(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<String, String> {
+    if status.success() {
+        return Ok(String::from_utf8_lossy(&stdout).into_owned());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&stderr);
     Err(stderr
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("git failed")
         .trim()
         .to_string())
+}
+
+struct IgnoredScanLock {
+    _file: File,
+}
+
+impl IgnoredScanLock {
+    fn acquire(root: &Path) -> Result<Self, String> {
+        let path = ignored_scan_lock_path(root);
+        let file = open_ignored_scan_lock(&path).or_else(|_| {
+            let fallback = ignored_scan_fallback_path(root);
+            open_ignored_scan_lock(&fallback)
+        })?;
+        file.try_lock()
+            .map_err(|e| format!("ignored-file scan already running: {e}"))?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn open_ignored_scan_lock(path: &Path) -> Result<File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("ignored-file scan lock: {e}"))?;
+    }
+    File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("ignored-file scan lock: {e}"))
+}
+
+fn ignored_scan_lock_path(root: &Path) -> PathBuf {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return dot_git.join("herdr-sidebar-ignored.lock");
+    }
+    if dot_git.is_file()
+        && let Ok(pointer) = std::fs::read_to_string(&dot_git)
+        && let Some(path) = pointer.trim().strip_prefix("gitdir:")
+    {
+        let path = PathBuf::from(path.trim());
+        return if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+        .join("herdr-sidebar-ignored.lock");
+    }
+    ignored_scan_fallback_path(root)
+}
+
+fn ignored_scan_fallback_path(root: &Path) -> PathBuf {
+    let mut normalized = root.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        normalized.make_ascii_lowercase();
+    }
+    let hash = normalized
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    let name = format!("ignored-scan-{hash:016x}.lock");
+    std::env::temp_dir().join(name)
 }
 
 /// Parse `git status --porcelain -z --branch` output. Entries are NUL-separated
@@ -512,14 +843,14 @@ pub fn parse_status(raw: &str) -> Status {
         if x != ' ' {
             status.staged.push(FileEntry {
                 path: path.clone(),
-                orig: orig.clone(),
+                orig: matches!(x, 'R' | 'C').then(|| orig.clone()).flatten(),
                 letter: display_letter(x),
             });
         }
         if y != ' ' {
             status.unstaged.push(FileEntry {
                 path,
-                orig,
+                orig: matches!(y, 'R' | 'C').then_some(orig).flatten(),
                 letter: display_letter(y),
             });
         }
@@ -571,13 +902,10 @@ pub fn under(path: &str, prefix: Option<&str>) -> bool {
             && path.as_bytes()[prefix.len()] == b'/')
 }
 
-/// The `!!` entries of a `--ignored` porcelain run: repo-relative roots of
-/// ignored files and (collapsed) ignored directories, trailing `/` stripped.
-/// Rename source fields can never start with `!! `, so a plain scan is safe
-/// without tracking the two-field rename shape.
+/// NUL-delimited paths from `ls-files --others --ignored --directory`, with
+/// the collapsed-directory trailing slash removed for normal path matching.
 pub fn parse_ignored(raw: &str) -> Vec<String> {
     raw.split('\0')
-        .filter_map(|entry| entry.strip_prefix("!! "))
         .map(|path| path.trim_end_matches('/').to_string())
         .filter(|path| !path.is_empty())
         .collect()
@@ -689,6 +1017,36 @@ mod tests {
     }
 
     #[test]
+    fn branch_choices_put_current_first_and_drop_symbolic_remote_head() {
+        let choices = parse_branch_choices(concat!(
+            " \0feature/x\0refs/heads/feature/x\0\n",
+            "*\0main\0refs/heads/main\0\n",
+            " \0origin/main\0refs/remotes/origin/main\0\n",
+            " \0origin/HEAD\0refs/remotes/origin/HEAD\0refs/remotes/origin/main\n",
+        ));
+        assert_eq!(
+            choices,
+            [
+                Branch {
+                    name: "main".into(),
+                    current: true,
+                    remote: false,
+                },
+                Branch {
+                    name: "origin/main".into(),
+                    current: false,
+                    remote: true,
+                },
+                Branch {
+                    name: "feature/x".into(),
+                    current: false,
+                    remote: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parses_ahead_behind_and_upstream() {
         let s = parse_status("## main...origin/main [ahead 3, behind 2]\0");
         assert_eq!((s.ahead, s.behind, s.has_upstream), (3, 2, true));
@@ -790,6 +1148,28 @@ mod tests {
     }
 
     #[test]
+    fn checkout_branch_switches_without_forcing_dirty_work() {
+        let git = repo_with_head("checkout-branch");
+        let original = git.status().unwrap().branch;
+        run_in(&git.root, &["branch", "topic"]).unwrap();
+        git.checkout_branch(&Branch {
+            name: "topic".into(),
+            current: false,
+            remote: false,
+        })
+        .unwrap();
+        assert_eq!(git.status().unwrap().branch, "topic");
+        git.checkout_branch(&Branch {
+            name: original.clone(),
+            current: false,
+            remote: false,
+        })
+        .unwrap();
+        assert_eq!(git.status().unwrap().branch, original);
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
     fn unstage_all_propagates_reset_failure_instead_of_destructive_fallback_when_head_exists() {
         let git = repo_with_head("unstage-all");
         std::fs::write(git.root.join("file.txt"), "v1").unwrap();
@@ -869,6 +1249,16 @@ mod tests {
     }
 
     #[test]
+    fn each_status_side_only_keeps_its_own_rename_source() {
+        let s = parse_status("RM new_name.rs\0old_name.rs\0");
+        assert_eq!(
+            s.staged,
+            vec![entry("new_name.rs", 'R', Some("old_name.rs"))]
+        );
+        assert_eq!(s.unstaged, vec![entry("new_name.rs", 'M', None)]);
+    }
+
+    #[test]
     fn type_change_reads_as_modified() {
         let s = parse_status("T  link.sh\0 T other.sh\0");
         assert_eq!(s.staged, vec![entry("link.sh", 'M', None)]);
@@ -894,11 +1284,38 @@ mod tests {
 
     #[test]
     fn ignored_entries_parse_into_roots() {
-        // `--untracked-files=normal` collapses an ignored directory to one
-        // entry; the trailing slash goes so it compares like any other path.
-        let raw = "## main\0!! target/\0!! build.log\0 M src/app.rs\0";
+        // `ls-files --directory` collapses an ignored directory to one entry;
+        // the trailing slash goes so it compares like any other path.
+        let raw = "target/\0build.log\0";
         assert_eq!(parse_ignored(raw), ["target", "build.log"]);
-        assert_eq!(parse_ignored("## main\0"), Vec::<String>::new());
+        assert_eq!(parse_ignored(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ignored_scan_lock_is_repository_scoped() {
+        let first = std::env::temp_dir().join("ignored-lock-a");
+        let second = std::env::temp_dir().join("ignored-lock-b");
+        assert_eq!(
+            ignored_scan_lock_path(&first),
+            ignored_scan_lock_path(&first)
+        );
+        assert_ne!(
+            ignored_scan_lock_path(&first),
+            ignored_scan_lock_path(&second)
+        );
+    }
+
+    #[test]
+    fn ignored_scan_lock_is_single_flight() {
+        let root =
+            std::env::temp_dir().join(format!("ignored-lock-single-flight-{}", std::process::id()));
+        let first = IgnoredScanLock::acquire(&root).unwrap();
+        assert!(
+            IgnoredScanLock::acquire(&root).is_err(),
+            "a second process must skip an outstanding scan"
+        );
+        drop(first);
+        IgnoredScanLock::acquire(&root).unwrap();
     }
 
     #[test]
@@ -1196,6 +1613,49 @@ mod tests {
     }
 
     #[test]
+    fn discarding_an_unstaged_rename_restores_only_its_snapshotted_paths() {
+        let git = repo_with_head("discard-rename");
+        std::fs::create_dir_all(git.root.join("src")).unwrap();
+        std::fs::write(git.root.join("src/old.rs"), "tracked").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        std::fs::rename(git.root.join("src/old.rs"), git.root.join("src/new.rs")).unwrap();
+        run_in(&git.root, &["add", "-N", "src/new.rs"]).unwrap();
+
+        let entry = git
+            .status()
+            .unwrap()
+            .unstaged
+            .into_iter()
+            .find(|entry| entry.orig.is_some())
+            .unwrap();
+        git.discard(&entry).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(git.root.join("src/old.rs")).unwrap(),
+            "tracked"
+        );
+        assert!(!git.root.join("src/new.rs").exists());
+        let status = git.status().unwrap();
+        assert!(status.staged.is_empty());
+        assert!(status.unstaged.is_empty());
+        let _ = std::fs::remove_dir_all(&git.root);
+    }
+
+    #[test]
     fn staging_a_single_file_stages_only_that_file() {
         let git = repo_with_head("stage-one");
         std::fs::create_dir_all(git.root.join("src")).unwrap();
@@ -1238,15 +1698,24 @@ mod tests {
     #[test]
     fn ignored_lists_the_repos_ignored_roots() {
         let git = repo_with_head("ignored");
-        std::fs::write(git.root.join(".gitignore"), "target/\n*.log\n").unwrap();
+        assert_eq!(
+            ignored_scan_lock_path(&git.root),
+            git.root.join(".git/herdr-sidebar-ignored.lock")
+        );
+        std::fs::write(
+            git.root.join(".gitignore"),
+            "target/\nempty-cache/\n*.log\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(git.root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(git.root.join("empty-cache")).unwrap();
         std::fs::write(git.root.join("target/debug/app.exe"), "bin").unwrap();
         std::fs::write(git.root.join("build.log"), "noise").unwrap();
         let mut ignored = git.ignored().unwrap();
         ignored.sort();
         assert_eq!(
             ignored,
-            ["build.log", "target"],
+            ["build.log", "empty-cache", "target"],
             "the ignored dir stays collapsed"
         );
         // Ignored paths are never stage candidates.

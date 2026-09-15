@@ -6,7 +6,31 @@ It is not the upstream GitHub release notes.
 
 How to maintain this fork: [`FORK.md`](FORK.md).
 
-Base: upstream `4faeea7` (v0.11.0, 2026-09-02).
+Base: upstream `1a5d37e` (v0.13.0, 2026-09-15).
+
+---
+
+## 2026-09-15 — merge upstream v0.13.0
+
+Pulled Search view, host activity actions (`show-explorer` / `show-search` /
+`show-git` / `quick-open`), Git footer/branch picker, image previews, and
+Herdr 0.9 tab-focus preview fixes. Kept this fork's per-workspace visibility,
+`prefix+shift+b` plugin toggle, configurable commit-message oneshot, and
+graceful toggle-close.
+
+Conflict resolutions:
+
+- `ensure.rs`: take upstream `View` / `Activate` launch paths; keep
+  `workspace_should_auto_open` instead of a global `auto_open` early-return;
+  keep `persist_hide_after_close` for toggle, keep `request_close` for TUI.
+- `launch.rs`: keep `event_pane_id` / `snooze_tab` / `workspace_id_from_scope`
+  and take `event_scope_with_tab_context`.
+- `explorer_app.rs` / `scm_app.rs`: hide still goes through `snooze::hide_pane`
+  (workspace record + pane close). Settings keep both Git footer and Commit
+  message rows.
+- Unix `ensure-sidebar.sh` / `open-sidebar.sh` follow upstream deletion; native
+  `--ensure` / `--toggle` now own those paths.
+- `Cargo.lock` regenerated after the merge (`cargo build --release`).
 
 ---
 

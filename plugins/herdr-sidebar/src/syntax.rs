@@ -56,7 +56,11 @@ pub fn highlight(name: &str, text: &str, max: usize) -> Option<Vec<Line<'static>
     let syntax = syntaxes
         .find_syntax_by_extension(ext)
         .or_else(|| syntaxes.find_syntax_by_extension(name))
-        .or_else(|| text.lines().next().and_then(|l| syntaxes.find_syntax_by_first_line(l)))?;
+        .or_else(|| {
+            text.lines()
+                .next()
+                .and_then(|l| syntaxes.find_syntax_by_first_line(l))
+        })?;
 
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
@@ -105,7 +109,9 @@ impl LineHighlighter {
         let syntax = syntaxes
             .find_syntax_by_extension(ext)
             .or_else(|| syntaxes.find_syntax_by_extension(name));
-        Self { inner: syntax.map(|s| HighlightLines::new(s, theme)) }
+        Self {
+            inner: syntax.map(|s| HighlightLines::new(s, theme)),
+        }
     }
 
     /// Highlight one line (no trailing newline in, none out).
@@ -161,11 +167,25 @@ mod tests {
 
     #[test]
     fn extended_grammars_cover_typescript_and_toml() {
-        assert!(highlight("app.ts", "const x: string = \"hi\";
-", 10).is_some());
-        assert!(highlight("Cargo.toml", "[package]
+        assert!(
+            highlight(
+                "app.ts",
+                "const x: string = \"hi\";
+",
+                10
+            )
+            .is_some()
+        );
+        assert!(
+            highlight(
+                "Cargo.toml",
+                "[package]
 name = \"x\"
-", 10).is_some());
+",
+                10
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -175,7 +195,10 @@ name = \"x\"
 
     #[test]
     fn pathologically_long_lines_skip_highlighting_instead_of_hanging() {
-        let long_line = format!("const x = \"{}\";\n", "a".repeat(MAX_HIGHLIGHT_LINE_LEN + 1));
+        let long_line = format!(
+            "const x = \"{}\";\n",
+            "a".repeat(MAX_HIGHLIGHT_LINE_LEN + 1)
+        );
         let lines = highlight("bundle.min.js", &long_line, 10).expect("js grammar matches");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].to_string(), long_line.trim_end_matches('\n'));

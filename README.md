@@ -11,9 +11,9 @@
 ### The sidebar your terminal was missing — inspired by VS Code.
 
 A file explorer and a full source-control panel in one dockable
-[herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching, mouse
-everywhere, AI-drafted commit messages, and file previews that open as editor tabs —
-ephemeral until you double-click to pin one.
+[herdr](https://github.com/ogulcancelik/herdr) pane — activity-bar switching,
+mouse-driven controls, AI-drafted commit messages, and file previews that open as editor
+tabs — ephemeral until you double-click to pin one.
 
 <img alt="Rust" src="https://img.shields.io/badge/Rust-self--contained_crate-orange?logo=rust&logoColor=white">
 <img alt="herdr" src="https://img.shields.io/badge/herdr-%E2%89%A5%200.8-5865a3">
@@ -27,11 +27,9 @@ ephemeral until you double-click to pin one.
 
 </div>
 
-That's the sidebar on the left and a 2×2 fleet of Claude Code and Codex agents beside it —
-the workflow herdr is built for. If you've ever alt-tabbed out of your terminal just to *look*
-at something — the tree, the diff, what's staged — this closes that loop. The sidebar docks
-on either edge of every herdr tab (left by default), restores itself on focus, and is driven
-entirely by click or keystroke.
+If you've ever alt-tabbed out of your terminal just to *look* at the tree, the diff, or
+what's staged, this closes that loop.
+
 
 ```
 herdr plugin install Cainiaooo/herdr-sidebar/plugins/herdr-sidebar --yes
@@ -42,21 +40,18 @@ That is **this fork**. The public upstream remains `alexarthurs/herdr-sidebar/pl
 Tagged releases install SHA-256-verified prebuilt binaries on supported Windows, macOS,
 and Linux systems. Unsupported targets or unavailable assets fall back to a source build.
 
----
 
-## One pane. Two views. Zero friction.
+## Three Views
 
-The activity bar at the top flips between **Explorer** and **Source Control** — *in
-process*, so switching is instant: no respawn, no flicker, no lost state on the way. Both
-views ship in one small Rust binary.
+The activity bar switches Explorer, Search, and Source Control instantly in one process.
+Use the mouse or press `1`, `2`, and `3`.
 
-### 🗂 The Explorer
-
-A real tree, not a directory dump:
+### Explorer & Preview
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/preview.png" alt="Explorer and live file preview interface" width="920">
+<img src="plugins/herdr-sidebar/docs/media/preview.png" alt="Explorer and file preview" width="920">
 </div>
+
 
 - Disclosure chevrons, nested indentation, and **two icon themes** — colored Nerd Font
   glyphs (Atom-Material style) or emoji, toggled live. The sidebar auto-picks: material
@@ -122,133 +117,110 @@ A real tree, not a directory dump:
   preview syntax, diffs, selections, and icons. `terminal` uses profile-mapped ANSI accents,
   while `vscode` preserves the original fixed dark palette and remains the default.
 
-### 🔀 Source Control
+
+### Source Control
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/source-control.png" alt="Source control: multi-repo staging, per-repo commit boxes, history drawers" width="920">
+<img src="plugins/herdr-sidebar/docs/media/source-control.png" alt="Source Control view" width="920">
 </div>
 
-Everything you reach for in an editor's source-control panel, in a terminal pane:
+- Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
+- Click the branch name—in the panel header, a repository row, or the Git footer—to
+  switch local branches or create a local tracking branch from a remote.
+- Use one commit box per repository in multi-repo folders.
+- Draft a commit message with the ✧ button through the local `claude` CLI, with a
+  filename-based fallback when Claude is unavailable.
+- Browse commits, file history, branches, worktrees, remotes, stashes, and tags.
+- Keep branch and sync controls visible in every sidebar view with the compact Git footer;
+  hide it from Settings if you prefer the extra row.
 
-- **Click a change, see the diff** — every changed file opens its colored `git diff` in
-  a preview tab (staged vs working tree respected, untracked shown as additions), and
-  the diff live-updates while you edit. Double-click to pin the tab; commits, stashes,
-  branches and tags in the history drawers open the same way.
-- **Stage, unstage, discard, commit** — by key or click, with Staged/Changes sections,
-  count badges, and familiar per-file status letters.
-- **✧ AI commit messages** — the sparkle button runs a **user-configured Agent CLI
-  oneshot** (Claude, Codex, Grok, or any argv you trust) and drops a drafted subject
-  line into the message box. Never commits by itself. No config file → the built-in
-  Claude haiku oneshot. Copy
-  [`docs/examples/commit-message.toml`](docs/examples/commit-message.toml) to
-  `%APPDATA%\herdr\plugins\config\herdr-sidebar\commit-message.toml` (unix:
-  `$XDG_CONFIG_HOME/herdr/plugins/config/herdr-sidebar/`) to switch CLIs. Missing
-  CLI or a failed oneshot falls back to a filename heuristic. Never blocks the UI.
-- **Sync Changes** — a `⇅ 1↑ 2↓` button appears when you're ahead/behind upstream; one
-  press runs `pull --rebase --autostash` + `push` in the background.
-- **Multi-repo** — child repositories are auto-discovered, each with its
-  own header (branch, dirty `*`, sync/commit icons), message box, and Commit button.
-- **History drawers**: GRAPH, COMMITS, FILE HISTORY (follows your selection), BRANCHES,
-  REMOTES, STASHES, TAGS.
-- **Auto-refreshing** — commits and edits made anywhere show up within seconds.
 
-## Prefer two panels? Take two panels.
+## Settings
+
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/separated.png" alt="Separated Source Control and Explorer panes" width="920">
+<img src="plugins/herdr-sidebar/docs/media/settings.png" alt="Sidebar settings" width="920">
 </div>
 
-The ⚙ settings modal — mouse-toggleable like everything else — flips between:
+Settings persist across tabs and restarts. Configure:
 
-- **Unified sidebar**: both views share one pane, the activity bar switches instantly.
-- **Separated panels**: Explorer and Source Control as independent side-by-side panes —
-  each keeping the full sidebar width.
+- Unified or separate Explorer and Source Control panes
+- Left/right docking and preferred width
+- Material/emoji icons and VS Code/light/terminal colors
+- Tab/pane preview placement and optional custom editor
+- Hidden files, Git decorations, Git footer, and footer hotkeys
+- Auto-open, strict open/close toggle, focus-on-open, and live folder following
 
-<div align="center">
-<img src="plugins/herdr-sidebar/docs/media/settings.png" alt="The settings modal" width="920">
-</div>
+The sidebar follows a neighbouring pane's working directory by default. A manually chosen
+folder stays put until that pane changes directory again.
 
-Dock side, sidebar width, icon theme, dotfile visibility, live-folder following, and the full hotkey
-reference live in the same modal (with a toggle if you'd rather keep the key hints
-pinned to the sidebar's footer), and every choice persists across restarts. However you
-split it, the dock takes care of itself: a focus hook re-docks the sidebar in any tab or
-workspace that's missing one — new project, new worktree, new window, it's just *there*.
+## Keys
 
-## Install
+| Explorer / Search | Action | Source Control | Action |
+|---|---|---|---|
+| `↑↓` / `jk` | move | `Enter` | stage / unstage |
+| `←→` / `hl` | fold / unfold | `a` / `u` | stage all / none |
+| `Enter` | toggle / preview | `c` | commit message |
+| `Ctrl+P` | quick open | `A` | draft message |
+| `Ctrl+F` | content search | `S` | sync |
+| `.` | hidden files | `o` | open diff |
+| `r` | refresh | `r` | refresh |
+| `m` | context menu | `m` | context menu |
+| `s` | settings | `s` | settings |
+| `b` | hide | `b` | hide |
+| `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
+Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown to scroll,
+`w` to toggle wrapping, and `q` or Esc to close.
+
+Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
+`quick-open` actions. For example, bind `cmd+p` to:
+
+```toml
+[[keys.command]]
+key = "cmd+p"
+type = "shell"
+command = "herdr plugin action invoke quick-open --plugin herdr-sidebar"
 ```
+
+## Install & Develop
+
+**Requirements:** herdr 0.8+. Source builds require Rust 1.89+.
+A Nerd Font is recommended for material icons; the emoji theme works everywhere.
+
+```sh
 herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
 ```
 
-or from a local checkout:
+Local checkout:
 
-```
+```sh
 cd plugins/herdr-sidebar
 cargo build --release
 herdr plugin link .
 ```
 
-Open it with an action (or just focus a tab and let the hook dock it):
+Open or toggle it:
 
-```
-herdr plugin action invoke herdr-sidebar.open-sidebar-windows   # windows
-herdr plugin action invoke herdr-sidebar.open-sidebar           # linux / macos
-```
-
-**Requirements:** Rust to build, herdr ≥ 0.8. **Recommended:** a Nerd Font terminal face
-for the material icons — without one the sidebar auto-starts in its emoji theme, which
-renders in any font. Note Windows Terminal's bundled Cascadia does NOT include the icon
-glyphs; grab a patched font in one command and select it in your terminal profile:
-
-```
-winget install DEVCOM.JetBrainsMonoNerdFont
+```sh
+herdr plugin action invoke herdr-sidebar.open-sidebar-windows   # Windows
+herdr plugin action invoke herdr-sidebar.open-sidebar           # Linux / macOS
 ```
 
-(or any font from [nerdfonts.com](https://www.nerdfonts.com/font-downloads), e.g.
-CaskaydiaCove). ✧ commit messages need an Agent CLI on `PATH` only if you use
-one — copy [`docs/examples/commit-message.toml`](docs/examples/commit-message.toml)
-into the user plugin config dir and set `command` to that CLI's argv.
+Useful development actions:
 
-## Keys
 
-| Explorer | | Source Control | |
-|---|---|---|---|
-| `↑↓` / `jk` | move | `⏎` | stage / unstage |
-| `←→` / `hl` | fold / unfold | `a` / `u` | stage all / none |
-| `⏎` | toggle folder · preview file | `c` | focus message box |
-| `r` | refresh | `A` | ✧ suggest message |
-| `.` | dotfiles | `S` | sync ↑↓ |
-| `m` | context menu | `o` | open diff |
-| `b` | hide sidebar | `m` | context menu |
-| `s` | settings | `b` | hide sidebar |
-| `1` / `2` | switch view | `s` | settings |
-| | | `1` / `2` | switch view |
+| Action | Purpose |
 
-In a preview tab: drag to select rendered text, `Ctrl/Cmd+C` copy, `↑↓` scroll,
-`⇞⇟` page, `g`/`G` ends, `w` toggle line wrapping, `q` close the tab.
-
-…and the mouse for all of it: click, double-click, scroll, hover, Ctrl+right-click menus.
-`m` opens the same menus from the keyboard, for terminals and mobile clients that have
-no right-click.
-
-### Experimental editor
-
-| Key | Action |
 |---|---|
-| `e` | enter edit mode from a regular file preview |
-| arrows · `Home` / `End` · `PageUp` / `PageDown` | navigate logical and wrapped rows |
-| `Shift` + navigation | select text |
-| click / drag / Shift+click | move the caret / select / extend selection |
-| `Ctrl/Cmd+A` · `Ctrl/Cmd+C/X/V` | select all · copy/cut/paste (clipboard where available) |
-| `Ctrl/Cmd+F` | find; `Enter` next, `Esc` close find |
-| `Ctrl/Cmd+S` | explicitly save |
-| `Esc` | return to read-only preview; prompts if dirty |
-| `Ctrl/Cmd+Q` | close the pane; prompts if dirty |
+| `open-sidebar` / `open-sidebar-windows` | open, focus, or hide the sidebar |
+| `open-git` / `open-git-windows` | toggle separate Source Control |
+| `show-explorer`, `show-search`, `show-git` | open/focus one activity without toggling |
+| `quick-open` | open/focus the sidebar and show the file picker |
+| `redeploy` / `redeploy-windows` | refresh running sidebars after a rebuild |
 
-Edit mode accepts valid UTF-8 text files up to the preview limits (1 MiB / 5000 lines).
-UTF-8 BOM and the file's LF/CRLF convention are preserved. Clean buffers reload external
-changes automatically; dirty buffers show an external-change warning and require an explicit
-overwrite or reload decision at save time.
+Use the `-windows` suffix for each direct action on Windows.
+
 
 ## Actions
 
@@ -291,6 +263,7 @@ Use `open-sidebar` instead of `open-sidebar-windows` on Linux or macOS, then run
 
 ---
 
+
 <div align="center">
-<sub>Screenshots: herdr on Windows Terminal, CaskaydiaCove Nerd Font.</sub>
+<sub>Screenshots: herdr on Windows Terminal with a Nerd Font.</sub>
 </div>

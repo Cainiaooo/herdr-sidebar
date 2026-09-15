@@ -1,7 +1,8 @@
 [package]
 name = "herdr-sidebar"
-version = "0.11.0"
+version = "0.13.0"
 edition = "2024"
+rust-version = "1.89"
 description = "VS Code-style sidebar for herdr: file explorer + source control in one pane"
 license = "MIT"
 
@@ -43,9 +44,27 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-fan
 # Ripgrep's filesystem walker, compiled into the prebuilt binary so Quick Open
 # honors repository ignore files without requiring an `rg` executable.
 ignore = "0.4"
+globset = "0.4"
+regex = "1"
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
 
 # Native folder picker for "Change Folder" on Windows. macOS uses osascript:
 # rfd's Cocoa backend aborts when called from the background thread required
 # to keep the TUI heartbeat alive. Linux keeps the typed-path fallback.
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

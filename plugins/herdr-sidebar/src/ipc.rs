@@ -45,9 +45,8 @@ pub fn socket_path() -> Option<PathBuf> {
 /// Send one request; return the raw response line (same JSON shape the herdr
 /// CLI prints, so `launch::*` parsers work on it unchanged).
 pub fn call_text(method: &str, params: serde_json::Value) -> std::io::Result<String> {
-    let path = socket_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no herdr socket path")
-    })?;
+    let path = socket_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no herdr socket path"))?;
     let request = serde_json::json!({
         "id": format!("herdr-sidebar:{method}"),
         "method": method,
@@ -64,31 +63,134 @@ pub fn call_text(method: &str, params: serde_json::Value) -> std::io::Result<Str
 /// null VALUE — `pane.report_metadata` MERGES the token map, so an empty
 /// map is a no-op (verified live, herdr 0.7.1).
 pub fn report_identity(pane_id: &str, my: crate::state::View, merged: bool) {
+    let _ = report_identity_checked(pane_id, my, merged);
+}
+
+/// Checked form used by launchers before they perform focus-emitting layout
+/// operations. A TUI heartbeat uses [`report_identity`] because a transient
+/// reporting failure should not end its event loop.
+pub fn report_identity_checked(
+    pane_id: &str,
+    my: crate::state::View,
+    merged: bool,
+) -> std::io::Result<()> {
     let now = crate::state::unix_now().to_string();
-    let mine = serde_json::json!({ my.plugin_id(): now });
-    let _ = call_text(
+    let mine = serde_json::json!({
+        my.plugin_id(): now,
+        crate::launch::STARTING_TOKEN: serde_json::Value::Null,
+    });
+    call_text(
         "pane.report_metadata",
         serde_json::json!({ "pane_id": pane_id, "source": my.plugin_id(), "tokens": mine }),
-    );
+    )?;
     let other = my.other();
     let other_tokens = if merged {
         serde_json::json!({ other.plugin_id(): now })
     } else {
         serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
     };
-    let _ = call_text(
+    call_text(
         "pane.report_metadata",
         serde_json::json!({
             "pane_id": pane_id,
             "source": other.plugin_id(),
             "tokens": other_tokens,
         }),
-    );
+    )?;
+    Ok(())
+}
+
+/// Mark the brief interval before a TUI reaches its event loop. Windows calls
+/// this after a raw split; directly spawned Unix TUIs call it immediately on
+/// process startup. The first full identity report clears the marker.
+pub fn report_starting_identity(
+    pane_id: &str,
+    my: crate::state::View,
+    merged: bool,
+) -> std::io::Result<()> {
+    let now = crate::state::unix_now().to_string();
+    call_text(
+        "pane.report_metadata",
+        serde_json::json!({
+            "pane_id": pane_id,
+            "source": my.plugin_id(),
+            "tokens": {
+                my.plugin_id(): now,
+                crate::launch::STARTING_TOKEN: "1",
+            },
+        }),
+    )?;
+    if merged {
+        let other = my.other();
+        call_text(
+            "pane.report_metadata",
+            serde_json::json!({
+                "pane_id": pane_id,
+                "source": other.plugin_id(),
+                "tokens": { other.plugin_id(): now },
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Spawn a Unix plugin pane directly from its manifest argv. Unlike a raw
+/// `pane.split` followed by terminal input, this never renders an interactive
+/// shell prompt before the TUI. Herdr 0.8.2 resolves relative pane commands
+/// against the process cwd, so the requested project cwd travels in an env
+/// var and `main` changes directory after the direct spawn.
+#[cfg(unix)]
+pub fn open_plugin_pane(
+    target_pane_id: &str,
+    view: crate::state::View,
+    cwd: &std::path::Path,
+    merged: bool,
+    initial_activity: Option<&str>,
+) -> std::io::Result<String> {
+    let mut env = crate::state::spawn_env();
+    if !cwd.as_os_str().is_empty()
+        && let Some(env) = env.as_object_mut()
+    {
+        env.insert(
+            crate::state::SPAWN_CWD_ENV.to_string(),
+            serde_json::Value::String(cwd.display().to_string()),
+        );
+    }
+    if let Some(initial_activity) = initial_activity
+        && let Some(env) = env.as_object_mut()
+    {
+        env.insert(
+            crate::state::INITIAL_ACTIVITY_ENV.to_string(),
+            serde_json::Value::String(initial_activity.to_string()),
+        );
+    }
+    let response = call_text(
+        "plugin.pane.open",
+        serde_json::json!({
+            "plugin_id": "herdr-sidebar",
+            "entrypoint": view.entrypoint(),
+            "placement": "split",
+            "target_pane_id": target_pane_id,
+            "direction": "right",
+            "focus": false,
+            "env": env,
+        }),
+    )?;
+    let pane_id = crate::launch::plugin_pane_id(&response).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("plugin.pane.open returned no pane id: {response}"),
+        )
+    })?;
+    if let Err(error) = report_identity_checked(&pane_id, view, merged) {
+        let _ = call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+        return Err(error);
+    }
+    Ok(pane_id)
 }
 
 /// Clear both sidebar identity tokens after the event loop has finished its
-/// final persistence. Launchers poll this acknowledgement before removing the
-/// now-idle shell pane.
+/// final persistence.
 pub fn clear_identity(pane_id: &str) {
     for view in [
         crate::state::View::Explorer,
@@ -99,7 +201,10 @@ pub fn clear_identity(pane_id: &str) {
             serde_json::json!({
                 "pane_id": pane_id,
                 "source": view.plugin_id(),
-                "tokens": { view.plugin_id(): serde_json::Value::Null },
+                "tokens": {
+                    view.plugin_id(): serde_json::Value::Null,
+                    crate::launch::STARTING_TOKEN: serde_json::Value::Null,
+                },
             }),
         );
     }
@@ -186,8 +291,8 @@ mod tests {
     /// so the test would fail if a future change dropped the timeout calls.
     #[test]
     fn exchange_times_out_instead_of_hanging_on_an_unresponsive_peer() {
-        let path = std::env::temp_dir()
-            .join(format!("aa-ipc-timeout-test-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("aa-ipc-timeout-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         std::thread::spawn(move || {
@@ -199,13 +304,20 @@ mod tests {
             }
         });
         let stream = UnixStream::connect(&path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_millis(200))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let start = std::time::Instant::now();
         let result = exchange(stream, "{}");
         let elapsed = start.elapsed();
         let _ = std::fs::remove_file(&path);
-        assert!(result.is_err(), "an unresponsive peer must not report success");
+        assert!(
+            result.is_err(),
+            "an unresponsive peer must not report success"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "must bail out around the timeout, not hang; took {elapsed:?}"

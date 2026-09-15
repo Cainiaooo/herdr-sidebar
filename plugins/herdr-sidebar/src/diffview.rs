@@ -134,7 +134,8 @@ fn word_ranges(evs: &[Ev]) -> HashMap<usize, (usize, usize)> {
             let mut suffix = 0;
             while suffix < old_chars.len().saturating_sub(prefix)
                 && suffix < new_chars.len().saturating_sub(prefix)
-                && old_chars[old_chars.len() - 1 - suffix] == new_chars[new_chars.len() - 1 - suffix]
+                && old_chars[old_chars.len() - 1 - suffix]
+                    == new_chars[new_chars.len() - 1 - suffix]
             {
                 suffix += 1;
             }
@@ -223,10 +224,7 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
                 format!("{}⋯", " ".repeat(w * 2 + 2)),
                 Style::default().dim(),
             ))),
-            Ev::Plain(t) => lines.push(Line::from(Span::styled(
-                t.clone(),
-                Style::default().dim(),
-            ))),
+            Ev::Plain(t) => lines.push(Line::from(Span::styled(t.clone(), Style::default().dim()))),
             Ev::Ctx(o, n, t) => {
                 old_hl.line(t);
                 let spans = new_hl.line(t);

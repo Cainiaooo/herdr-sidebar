@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::icons::IconTheme;
@@ -28,6 +28,8 @@ pub struct Palette {
     pub ignored: Color,
     pub selection_bg: Color,
     pub selection_unfocused_bg: Color,
+    /// Full-size activity-bar hover: visibly related to selection, but weaker.
+    pub activity_hover_bg: Color,
     pub hover_bg: Color,
     pub accent: Color,
     pub accent_focus: Color,
@@ -80,6 +82,7 @@ const VSCODE_PALETTE: Palette = Palette {
     ignored: Color::Rgb(0x6b, 0x6b, 0x6b),
     selection_bg: Color::DarkGray,
     selection_unfocused_bg: Color::Rgb(0x2a, 0x2d, 0x2e),
+    activity_hover_bg: Color::Rgb(0x3c, 0x42, 0x5d),
     hover_bg: Color::Rgb(48, 52, 60),
     accent: Color::Rgb(0x00, 0x78, 0xd4),
     accent_focus: Color::Rgb(0x02, 0x8a, 0xf0),
@@ -120,6 +123,7 @@ const LIGHT_PALETTE: Palette = Palette {
     ignored: Color::Rgb(0x8c, 0x8c, 0x8c),
     selection_bg: Color::Rgb(0xcc, 0xe3, 0xf5),
     selection_unfocused_bg: Color::Rgb(0xe4, 0xe6, 0xe8),
+    activity_hover_bg: Color::Rgb(0xe3, 0xef, 0xf9),
     hover_bg: Color::Rgb(0xec, 0xec, 0xec),
     accent: Color::Rgb(0x00, 0x78, 0xd4),
     accent_focus: Color::Rgb(0x02, 0x6e, 0xc1),
@@ -161,6 +165,7 @@ const TERMINAL_PALETTE: Palette = Palette {
     ignored: Color::DarkGray,
     selection_bg: Color::DarkGray,
     selection_unfocused_bg: Color::Black,
+    activity_hover_bg: Color::Rgb(0x3c, 0x42, 0x5d),
     hover_bg: Color::Black,
     accent: Color::Blue,
     accent_focus: Color::LightBlue,
@@ -233,7 +238,11 @@ pub fn is_light() -> bool {
 /// `Style::fg` only when the palette names a foreground; `Color::Reset` means
 /// "leave the terminal's own", which is what the dark palettes want.
 fn with_fg(style: Style, fg: Color) -> Style {
-    if fg == Color::Reset { style } else { style.fg(fg) }
+    if fg == Color::Reset {
+        style
+    } else {
+        style.fg(fg)
+    }
 }
 
 fn selection_style_for(theme: ColorTheme, focused: bool) -> Style {
@@ -263,6 +272,53 @@ fn hover_style_for(theme: ColorTheme) -> Style {
 
 pub fn hover_style() -> Style {
     hover_style_for(active_color_theme())
+}
+
+/// Idle/hover styling shared by compact chrome buttons. Title actions and
+/// always-visible toolbars should look like one family rather than inventing
+/// a separate filled-button treatment for each surface.
+pub fn chrome_button_style(hovered: bool) -> Style {
+    if hovered {
+        Style::default()
+            .bg(palette().keycap_bg)
+            .fg(palette().keycap_fg)
+    } else {
+        Style::default().dim()
+    }
+}
+
+/// Activity-bar buttons keep the stronger selected chip when active and use
+/// the same subtle keycap hover as the title-bar actions when inactive.
+pub fn activity_button_style(active: bool, hovered: bool) -> Style {
+    if active {
+        selection_style(true)
+    } else if hovered {
+        Style::default()
+            .bg(palette().activity_hover_bg)
+            .fg(palette().keycap_fg)
+    } else {
+        Style::default().dim()
+    }
+}
+
+/// Extend an activity button's middle-row fill into its spacer rows with
+/// half blocks. Hover and selection use the exact same three-row geometry.
+pub fn draw_activity_caps(
+    frame: &mut Frame,
+    bounds: (u16, u16),
+    outer_top: u16,
+    outer_bottom: u16,
+    color: Color,
+) {
+    let width = bounds.1.saturating_sub(bounds.0);
+    if width == 0 {
+        return;
+    }
+    let cap = |glyph: &str| {
+        Paragraph::new(glyph.repeat(usize::from(width))).style(Style::default().fg(color))
+    };
+    frame.render_widget(cap("▄"), Rect::new(bounds.0, outer_top, width, 1));
+    frame.render_widget(cap("▀"), Rect::new(bounds.0, outer_bottom, width, 1));
 }
 
 /// A file-type icon's fixed color, dimmed into legibility when the terminal
@@ -353,9 +409,7 @@ pub fn wrap_hints(
         line.push(Span::raw(if line.is_empty() { " " } else { "  " }));
         line.push(Span::styled(
             format!(" {key} "),
-            Style::default()
-                .bg(colors.keycap_bg)
-                .fg(colors.keycap_fg),
+            Style::default().bg(colors.keycap_bg).fg(colors.keycap_fg),
         ));
         line.push(Span::styled(format!(" {label}"), Style::default().dim()));
         used += if line.len() == 3 { w } else { 2 + w };
@@ -390,13 +444,13 @@ pub fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height:
     row == pane_height.saturating_sub(1) && column >= pane_width.saturating_sub(4)
 }
 
-/// Theme-matched activity-bar icons: (explorer, source control). Both FA
+/// Theme-matched activity-bar icons: (explorer, search, source control). FA
 /// glyphs render two cells wide in the non-Mono Nerd Font — chips reserve
 /// the second cell (see the activity-bar renderer).
-pub fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
+pub fn activity_icons(theme: IconTheme) -> (&'static str, &'static str, &'static str) {
     match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{f126}"),
-        IconTheme::Emoji => ("📁", "🔀"),
+        IconTheme::Material => ("\u{f07b}", "\u{f002}", "\u{f126}"),
+        IconTheme::Emoji => ("📁", "🔍", "🔀"),
     }
 }
 
@@ -498,13 +552,7 @@ pub fn title_action_spans(
         let chip = title_action_chip(theme, action);
         let w = Span::raw(chip.as_str()).width() as u16;
         let rect = Rect::new(cx, y, w, 1);
-        let style = if hover.is_some_and(|(hx, hy)| hits(rect, hx, hy)) {
-            Style::default()
-                .bg(palette().keycap_bg)
-                .fg(palette().keycap_fg)
-        } else {
-            Style::default().dim()
-        };
+        let style = chrome_button_style(hover.is_some_and(|(hx, hy)| hits(rect, hx, hy)));
         spans.push(Span::styled(chip, style));
         zones.push((rect, action));
         cx += w;
@@ -514,6 +562,11 @@ pub fn title_action_spans(
 
 pub fn within(x: u16, (start, end): (u16, u16)) -> bool {
     (start..end).contains(&x)
+}
+
+pub fn hits_activity_button((start, end): (u16, u16), middle_row: u16, x: u16, y: u16) -> bool {
+    within(x, (start, end))
+        && (middle_row.saturating_sub(1)..=middle_row.saturating_add(1)).contains(&y)
 }
 
 pub fn hits(rect: Rect, x: u16, y: u16) -> bool {
@@ -617,8 +670,7 @@ pub fn sibling_panes_of(pane_list_json: &str, my_pane_id: &str, other: View) -> 
         #[serde(default)]
         tokens: serde_json::Map<String, serde_json::Value>,
     }
-    let Ok(msg) = serde_json::from_str::<Msg>(pane_list_json.trim_start_matches('\u{feff}'))
-    else {
+    let Ok(msg) = serde_json::from_str::<Msg>(pane_list_json.trim_start_matches('\u{feff}')) else {
         return Vec::new();
     };
     let panes = &msg.result.panes;
@@ -683,6 +735,7 @@ mod tests {
         for bg in [
             light.selection_bg,
             light.selection_unfocused_bg,
+            light.activity_hover_bg,
             light.hover_bg,
             light.keycap_bg,
             light.text_selection_bg,
@@ -701,6 +754,7 @@ mod tests {
         // hold together on its own — and the label may never be a NAMED color:
         // `Color::White` is ANSI 15, which a light profile draws as pale grey.
         assert!(luma(light.button_bg) > 0.6 && luma(light.button_focus_bg) > 0.6);
+        assert!(luma(light.activity_hover_bg) > luma(light.selection_bg));
         assert!(luma(light.button_fg) < 0.35);
         assert!(
             luma(light.muted_button_bg) > luma(light.button_bg),
@@ -722,6 +776,30 @@ mod tests {
         // `Color::Reset` is "leave it alone", never an emitted foreground.
         assert_eq!(selection_style_for(ColorTheme::VsCode, true).fg, None);
         assert_eq!(hover_style_for(ColorTheme::Light).fg, None);
+    }
+
+    #[test]
+    fn activity_buttons_select_hover_and_idle_in_that_order() {
+        let active = activity_button_style(true, true);
+        assert!(active.add_modifier.contains(Modifier::BOLD));
+        assert!(!active.add_modifier.contains(Modifier::DIM));
+
+        let hovered = activity_button_style(false, true);
+        assert_eq!(hovered.bg, Some(palette().activity_hover_bg));
+        assert!(!hovered.add_modifier.contains(Modifier::DIM));
+
+        let idle = activity_button_style(false, false);
+        assert!(idle.add_modifier.contains(Modifier::DIM));
+        assert!(idle.bg.is_none());
+    }
+
+    #[test]
+    fn activity_button_hitbox_matches_all_three_highlight_rows() {
+        for row in 4..=6 {
+            assert!(hits_activity_button((10, 14), 5, 12, row));
+        }
+        assert!(!hits_activity_button((10, 14), 5, 9, 5));
+        assert!(!hits_activity_button((10, 14), 5, 12, 7));
     }
 
     #[test]
@@ -766,9 +844,11 @@ mod tests {
             selection_style_for(ColorTheme::Terminal, true).fg,
             Some(Color::White)
         );
-        assert!(!selection_style_for(ColorTheme::Terminal, true)
-            .add_modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            !selection_style_for(ColorTheme::Terminal, true)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
         let hover = hover_style_for(ColorTheme::Terminal);
         assert_eq!(hover.bg, Some(Color::Black));
         assert_eq!(hover.fg, Some(Color::Gray));
@@ -800,12 +880,19 @@ mod tests {
             );
         }
         assert_eq!(
-            lines.join("").split_whitespace().collect::<Vec<_>>().join(" "),
+            lines
+                .join("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             "Delete 'test' permanently? (y/N)",
             "no words lost"
         );
         // Wide panes stay single-line.
-        assert_eq!(wrap_footer_message("Delete 'test' permanently? (y/N)", 80, 4).len(), 1);
+        assert_eq!(
+            wrap_footer_message("Delete 'test' permanently? (y/N)", 80, 4).len(),
+            1
+        );
         // An unbreakable long word hard-breaks instead of overflowing.
         let long = wrap_footer_message("Deleted averyveryverylongfilename.extension", 20, 4);
         assert!(long.len() > 1);
@@ -893,7 +980,8 @@ mod tests {
     fn title_actions_hide_without_recent_mouse() {
         assert!(!title_actions_visible(None));
         assert!(title_actions_visible(Some(std::time::Instant::now())));
-        let old = std::time::Instant::now() - TITLE_ACTIONS_LINGER - std::time::Duration::from_secs(1);
+        let old =
+            std::time::Instant::now() - TITLE_ACTIONS_LINGER - std::time::Duration::from_secs(1);
         assert!(!title_actions_visible(Some(old)));
     }
 

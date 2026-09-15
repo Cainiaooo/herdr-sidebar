@@ -50,7 +50,9 @@ pub fn hide_pane(pane_id: &str) {
 pub fn sweep(dir: &std::path::Path, live_tabs: &std::collections::BTreeSet<String>) {
     let live: std::collections::BTreeSet<String> =
         live_tabs.iter().map(|t| t.replace(':', "_")).collect();
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if !live.contains(&entry.file_name().to_string_lossy().into_owned()) {
             let _ = std::fs::remove_file(entry.path());
