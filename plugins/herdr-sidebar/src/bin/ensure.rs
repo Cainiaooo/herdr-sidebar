@@ -24,6 +24,10 @@ fn main() {
         Some("--quick-open") => {
             herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::QuickOpen)
         }
+        Some("--restore") => herdr_sidebar::ensure::Mode::Restore,
+        _ if std::env::var("HERDR_PLUGIN_EVENT").as_deref() == Ok("startup") => {
+            herdr_sidebar::ensure::Mode::Restore
+        }
         _ => herdr_sidebar::ensure::Mode::Ensure,
     };
     // Errors are deliberately silent: there is no console to print to, herdr

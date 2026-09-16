@@ -171,6 +171,11 @@ impl Pane {
         matches!(self.label.as_deref(), Some("Sidebar" | "Explorer"))
             && !self.tokens.contains_key(METADATA_SOURCE)
     }
+
+    fn is_explorer_corpse(&self, now: u64) -> bool {
+        self.is_explorer()
+            && (self.our_label_without_token() || token_stale(&self.tokens, METADATA_SOURCE, now))
+    }
 }
 
 /// The unified pane's label (mirrors state::SIDEBAR_LABEL; kept here so the
@@ -256,6 +261,27 @@ pub fn launch_decision(pane_list_json: &str, now: u64) -> String {
     launch_decision_in(pane_list_json, now, "")
 }
 
+/// Every Explorer/Sidebar corpse in a `pane list` JSON: `(tab_id, pane_id)`.
+///
+/// [`launch_decision_in`] only sees the first explorer in a tab, so a live
+/// pane listed before a restored corpse would hide it. Startup restore has
+/// to close every corpse, including extras sitting next to a live TUI.
+pub fn explorer_corpses(pane_list_json: &str, now: u64) -> Vec<(String, String)> {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return Vec::new();
+    };
+    msg.result
+        .panes
+        .iter()
+        .filter(|pane| pane.is_explorer_corpse(now))
+        .filter_map(|pane| {
+            let tab_id = pane.tab_id.as_deref().filter(|id| is_flag_safe(id))?;
+            let pane_id = pane.pane_id.as_deref().filter(|id| is_flag_safe(id))?;
+            Some((tab_id.to_string(), pane_id.to_string()))
+        })
+        .collect()
+}
+
 /// [`launch_decision`] confined to `scope` (a tab or workspace id), so the
 /// decision reasons about the tab the hook is actually docking into. An
 /// empty scope keeps the global behavior.
@@ -289,7 +315,7 @@ pub fn launch_decision_in(pane_list_json: &str, now: u64, scope: &str) -> String
     let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
         return "OPEN".to_string();
     };
-    if token_stale(&pane.tokens, METADATA_SOURCE, now) || pane.our_label_without_token() {
+    if pane.is_explorer_corpse(now) {
         return format!("REPLACE {id}");
     }
     if Some(id) == focused.pane_id.as_deref() {
@@ -592,7 +618,10 @@ pub fn workspace_id_from_scope(scope: &str, pane_list_json: &str) -> String {
     let from_panes = if let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json))
     {
         let pane = if scope.contains(':') {
-            msg.result.panes.iter().find(|p| p.tab_id.as_deref() == Some(scope))
+            msg.result
+                .panes
+                .iter()
+                .find(|p| p.tab_id.as_deref() == Some(scope))
         } else if scope.is_empty() {
             msg.result.panes.iter().find(|p| p.focused)
         } else {
@@ -613,7 +642,11 @@ pub fn workspace_id_from_scope(scope: &str, pane_list_json: &str) -> String {
     {
         return ws.to_string();
     }
-    if is_flag_safe(scope) { scope.to_string() } else { String::new() }
+    if is_flag_safe(scope) {
+        scope.to_string()
+    } else {
+        String::new()
+    }
 }
 
 pub fn event_scope_with_tab_context(
@@ -633,7 +666,6 @@ pub fn event_scope_with_tab_context(
         scope
     }
 }
-
 
 /// The pane whose cwd a sidebar docked into `scope` should be rooted from:
 /// the focused pane WITHIN that scope, else any pane in it (a brand-new space
@@ -1496,6 +1528,31 @@ mod tests {
             r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-sidebar-git":95}}}}"#
         ));
         assert_eq!(launch_decision_git(&sc_live, 100), "FOCUS w1:p3");
+    }
+
+    #[test]
+    fn explorer_corpses_lists_every_dead_sidebar_even_beside_a_live_one() {
+        let json = pane_list(&format!(
+            r#"{FOCUSED},
+               {{"pane_id":"w1:p2","label":"Sidebar","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":95}}}},
+               {{"pane_id":"w1:p3","label":"Sidebar","tab_id":"w1:t1"}},
+               {{"pane_id":"w2:p1","label":"Sidebar","tab_id":"w2:t1"}},
+               {{"pane_id":"w2:p2","label":"Explorer","tab_id":"w2:t2","tokens":{{"herdr-sidebar-explorer":95}}}}"#
+        ));
+        assert_eq!(
+            explorer_corpses(&json, 100),
+            vec![
+                ("w1:t1".to_string(), "w1:p3".to_string()),
+                ("w2:t1".to_string(), "w2:p1".to_string()),
+            ]
+        );
+        // First explorer in w1:t1 is live, so the single-tab decision hides the
+        // corpse — restore must not use that path.
+        assert_eq!(launch_decision_in(&json, 100, "w1:t1"), "FOCUS w1:p2");
+        let live_only = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p2","label":"Sidebar","tab_id":"w1:t1","tokens":{{"herdr-sidebar-explorer":95}}}}"#
+        ));
+        assert!(explorer_corpses(&live_only, 100).is_empty());
     }
 
     #[test]

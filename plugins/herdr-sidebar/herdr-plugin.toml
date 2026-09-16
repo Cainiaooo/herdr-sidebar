@@ -155,6 +155,19 @@ title = "Redeploy sidebar panes"
 description = "Close all sidebar panes in every workspace so they respawn on the latest build."
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/redeploy.ps1"]
 
+# Herdr 0.9 restores pane labels after a server restart but does not replay
+# focus/create events for the already-focused workspace, so [[events]] cannot
+# heal the session the user is looking at. [[startup]] runs after restore
+# once the API socket is ready; --restore closes every label-only corpse and
+# re-docks tabs that should auto-open, without stealing focus.
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--restore"]
+
+[[startup]]
+platforms = ["windows"]
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--restore"]
+
 # Sidebar mode: on every tab focus, quietly ensure the focused tab
 # has a sidebar at the configured dock edge (idempotent, never steals focus). A tab hooked at
 # first focus still has its single full-height pane, so the sidebar becomes a

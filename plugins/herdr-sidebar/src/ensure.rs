@@ -13,6 +13,9 @@ use crate::{ipc, launch, state::View};
 pub enum Mode {
     /// A focus/create hook quietly ensures the Explorer exists.
     Ensure,
+    /// After a Herdr server restart: replace every restored corpse and
+    /// re-dock tabs that should auto-open, without stealing focus.
+    Restore,
     /// An explicit user action toggles the requested view.
     Toggle(View),
     /// An explicit host keybinding opens or focuses a specific activity.
@@ -110,6 +113,9 @@ use crate::snooze;
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
 pub fn run(mode: Mode) -> std::io::Result<()> {
+    if matches!(mode, Mode::Restore) {
+        return restore_all();
+    }
     let toggle = matches!(mode, Mode::Toggle(_));
     let activation = match mode {
         Mode::Activate(target) => Some(target),
@@ -118,7 +124,7 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     let explicit = toggle || activation.is_some();
     let state = crate::state::load_state();
     let view = match mode {
-        Mode::Ensure => View::Explorer,
+        Mode::Ensure | Mode::Restore => View::Explorer,
         Mode::Toggle(view) => view,
         Mode::Activate(target) => target.pane_view(state.merged),
     };
@@ -181,9 +187,16 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
             panes = ipc::call_text("pane.list", serde_json::json!({}))?;
             if let Some(target) = activation {
                 prepare_activation(target);
-                open(&panes, true, &scope, view, Some(target))?;
+                open(&panes, true, &scope, view, Some(target), false)?;
             } else {
-                open(&panes, toggle && state.focus_on_open, &scope, view, None)?;
+                open(
+                    &panes,
+                    toggle && state.focus_on_open,
+                    &scope,
+                    view,
+                    None,
+                    false,
+                )?;
                 if toggle {
                     remember_scope(&panes, &scope, true);
                 }
@@ -194,27 +207,90 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
                 if tracks_snooze {
                     snooze::clear(&snooze_dir, &tab);
                 }
-                open(&panes, state.focus_on_open, &scope, view, None)?;
+                open(&panes, state.focus_on_open, &scope, view, None, false)?;
                 remember_scope(&panes, &scope, true);
             } else if let Some(target) = activation {
                 if tracks_snooze {
                     snooze::clear(&snooze_dir, &tab);
                 }
                 prepare_activation(target);
-                open(&panes, true, &scope, view, Some(target))?;
+                open(&panes, true, &scope, view, Some(target), false)?;
             } else if auto && !snooze::is_set(&snooze_dir, &tab) {
-                open(&panes, false, &scope, view, None)?;
+                open(&panes, false, &scope, view, None, false)?;
             }
         }
     }
     Ok(())
 }
 
-fn workspace_should_auto_open(
-    state: &crate::state::State,
-    panes: &str,
-    scope: &str,
-) -> bool {
+/// Herdr 0.9 restores pane labels after a server restart but does not replay
+/// focus events for the already-focused workspace, and `launch_decision_in`
+/// only sees the first explorer in a tab. Walk every corpse, close it, then
+/// re-dock tabs that should auto-open. Hold the launcher lock the whole time
+/// so the splits cannot re-enter ensure.
+fn restore_all() -> std::io::Result<()> {
+    let Some(_lock) = LaunchLock::acquire(true) else {
+        return Ok(());
+    };
+    let mut panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    let original_focus = launch::server_focused_pane_id(&panes);
+    wait_for_session_layout(&original_focus);
+    panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    let state = crate::state::load_state();
+    let snooze_dir = snooze::dir();
+    snooze::sweep(&snooze_dir, &launch::live_tabs(&panes));
+    let now = crate::state::unix_now();
+    let corpses = launch::explorer_corpses(&panes, now);
+    if corpses.is_empty() {
+        return Ok(());
+    }
+    let mut tabs: Vec<String> = Vec::new();
+    for (tab, pane_id) in &corpses {
+        let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
+        if !tabs.iter().any(|existing| existing == tab) {
+            tabs.push(tab.clone());
+        }
+    }
+    panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    for tab in tabs {
+        if snooze::is_set(&snooze_dir, &tab) {
+            continue;
+        }
+        if !workspace_should_auto_open(&state, &panes, &tab) {
+            continue;
+        }
+        let decision = launch::launch_decision_in(&panes, crate::state::unix_now(), &tab);
+        if decision != "OPEN" {
+            continue;
+        }
+        open(&panes, false, &tab, View::Explorer, None, true)?;
+        panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    }
+    panes = ipc::call_text("pane.list", serde_json::json!({}))?;
+    if !original_focus.is_empty() && launch::tab_of(&panes, &original_focus).is_empty() {
+        return Ok(());
+    }
+    if !original_focus.is_empty() {
+        let _ = focus(&original_focus);
+    }
+    Ok(())
+}
+
+fn wait_for_session_layout(pane_id: &str) {
+    if pane_id.is_empty() {
+        return;
+    }
+    for _ in 0..50 {
+        if let Ok(layout) = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": pane_id }))
+            && launch::layout_width(&layout).unwrap_or(0) >= 20
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn workspace_should_auto_open(state: &crate::state::State, panes: &str, scope: &str) -> bool {
     let workspace_id = launch::workspace_id_from_scope(scope, panes);
     let label = ipc::call_text("workspace.list", serde_json::json!({}))
         .map(|json| launch::workspace_label(&json, &workspace_id))
@@ -328,6 +404,7 @@ fn open(
     scope: &str,
     view: View,
     initial: Option<Target>,
+    skip_focus: bool,
 ) -> std::io::Result<()> {
     // Root the new sidebar from a pane in the scope we are docking into —
     // the decision above answered for that scope, and the two must agree or
@@ -432,13 +509,17 @@ fn open(
     }
     full_height_repair(&new_pane, dock_right);
 
-    if focus_new {
-        focus(&new_pane)?;
-    } else {
-        // Quiet mode must never move focus, but the split/swap can (focus
-        // follows the SLOT, not the pane) — unconditionally restore the pane
-        // that was focused when we started.
-        focus(fid)?;
+    // Startup restore walks every workspace; focusing the split source
+    // would yank the user out of the tab they are already in.
+    if !skip_focus {
+        if focus_new {
+            focus(&new_pane)?;
+        } else {
+            // Quiet mode must never move focus, but the split/swap can (focus
+            // follows the SLOT, not the pane) — unconditionally restore the pane
+            // that was focused when we started.
+            focus(fid)?;
+        }
     }
     Ok(())
 }

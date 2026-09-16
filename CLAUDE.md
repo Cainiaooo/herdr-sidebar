@@ -462,6 +462,15 @@ HACKING.md — budget time for that before promising a patched build.
   the Windows raw-split launcher stamps it before starting the command. The first full identity
   report clears that marker. A toggle may close a still-starting pane directly because it cannot
   contain unsaved in-memory state yet. Label-only panes remain unambiguously restored corpses.
+- **Herdr 0.9 still leaves the already-focused workspace unhealed** (verified 2026-09-16
+  against herdr 0.9.0 on Windows): lifecycle subscriptions start with live events and do
+  not replay restored history, so the workspace that is focused after restart never gets
+  `workspace.focused` / `pane.focused`. `[[startup]]` `--restore` is the hook that runs
+  after restore when the API socket is ready. It closes every Explorer/Sidebar corpse
+  (not just the first explorer in a tab — a live pane listed first hid extras from
+  `launch_decision_in`) and re-docks tabs that should auto-open. Startup may run before
+  the client has given the session a size; `--restore` waits up to 5s for a layout width
+  ≥20. Focus hooks remain the path for later tab/workspace switches.
 - A focus event may yield when the launcher lock is held because another focus event follows, but
   `tab.created` is discrete and must block for the OS lock or a preview tab can permanently miss
   its sidebar (issue #32). Herdr's `EventEnvelope` serializes the JSON discriminator as

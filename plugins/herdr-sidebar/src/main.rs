@@ -27,6 +27,7 @@ fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
     match mode.as_deref() {
         Some("--ensure") => return ensure::run(ensure::Mode::Ensure),
+        Some("--restore") => return ensure::run(ensure::Mode::Restore),
         Some("--toggle") => {
             return ensure::run(ensure::Mode::Toggle(View::Explorer));
         }
@@ -138,9 +139,9 @@ fn main() -> std::io::Result<()> {
         Some("--remember-sidebar") => {
             // Unix toggle launcher: `on`/`off` then workspace id; workspace
             // list JSON on stdin so the record is keyed by label.
-            let visible = std::env::args().nth(2).is_some_and(|v| {
-                matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1")
-            });
+            let visible = std::env::args()
+                .nth(2)
+                .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1"));
             let workspace_id = std::env::args().nth(3).unwrap_or_default();
             let list = read_stdin().unwrap_or_default();
             let label = launch::workspace_label(&list, &workspace_id);

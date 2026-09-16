@@ -10,6 +10,35 @@ Base: upstream `1a5d37e` (v0.13.0, 2026-09-15).
 
 ---
 
+## 2026-09-16 — restore sidebars after Herdr 0.9 restart
+
+Herdr 0.9 restores pane labels after a server restart but does not replay
+focus/create events for the workspace that is already focused. The v0.13.0
+`workspace.focused` hook therefore never heals the session the user is looking
+at: the Sidebar slot comes back empty (`revision` 0, no heartbeat token).
+`launch_decision_in` also only sees the first explorer in a tab, so a live
+pane listed before a restored corpse left the corpse in place.
+
+### Added
+
+- `[[startup]]` + `--restore`: after session restore, close every Explorer/
+  Sidebar corpse and re-dock tabs that should auto-open. Does not add
+  sidebars to tabs that never had one. Does not steal focus.
+- `launch::explorer_corpses`: lists every corpse, including extras sitting
+  next to a live TUI.
+
+### Files
+
+| Path | Role |
+|---|---|
+| `plugins/herdr-sidebar/herdr-plugin.toml` | unix/windows `[[startup]]` |
+| `plugins/herdr-sidebar/src/ensure.rs` | `Mode::Restore` / `restore_all` |
+| `plugins/herdr-sidebar/src/launch.rs` | `explorer_corpses` |
+| `plugins/herdr-sidebar/src/main.rs` | `--restore` |
+| `plugins/herdr-sidebar/src/bin/ensure.rs` | `--restore` and `HERDR_PLUGIN_EVENT=startup` |
+
+---
+
 ## 2026-09-15 — merge upstream v0.13.0
 
 Pulled Search view, host activity actions (`show-explorer` / `show-search` /
